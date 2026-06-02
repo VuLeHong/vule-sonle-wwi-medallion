@@ -20,11 +20,41 @@
 # META   }
 # META }
 
+# PARAMETERS CELL ********************
+
+# parameters
+object_name = ""
+watermark_value = ""
+layer_value=""
+
+# METADATA ********************
+
+# META {
+# META   "language": "python",
+# META   "language_group": "synapse_pyspark"
+# META }
+
 # CELL ********************
 
-# Welcome to your new notebook
-# Type here in the cell editor to add code!
+from pyspark.sql import Row
+from datetime import datetime
 
+data = [
+    Row(
+        timestamp=datetime.utcnow(),
+        layer=layer_value,
+        object_name=object_name,
+        key_1=str(watermark_value),
+        key_1_desc="datetime"
+    )
+]
+
+df = spark.createDataFrame(data)
+
+df.write \
+    .format("delta") \
+    .mode("append") \
+    .saveAsTable("etl.watermark")
 
 # METADATA ********************
 
