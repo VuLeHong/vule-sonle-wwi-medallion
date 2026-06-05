@@ -30,7 +30,7 @@
 from pyspark.sql import Row
 
 METADATA_DB  = "lh_vule_sonle_medallion"
-CONFIG_TABLE = f"{METADATA_DB}.etl.config_bronze_tables"
+CONFIG_TABLE = f"{METADATA_DB}.etl.config_silver_tables"
 
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {METADATA_DB}.etl")
 

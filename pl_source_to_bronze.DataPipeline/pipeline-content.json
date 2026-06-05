@@ -70,7 +70,7 @@
                           "enableVertiParquet": true
                         },
                         "storeSettings": {
-                          "type": "LakehouseWriteSettings"
+                          "type": "AzureBlobStorageWriteSettings"
                         },
                         "datasetSettings": {
                           "type": "Parquet",
@@ -212,6 +212,22 @@
                         },
                         "partitionOption": "None",
                         "queryTimeout": "02:00:00",
+                        "additionalColumns": [
+                          {
+                            "name": "source_id",
+                            "value": {
+                              "value": "@item().source_system",
+                              "type": "Expression"
+                            }
+                          },
+                          {
+                            "name": "audit_ts",
+                            "value": {
+                              "value": "@utcNow()",
+                              "type": "Expression"
+                            }
+                          }
+                        ],
                         "datasetSettings": {
                           "type": "DataWarehouseTable",
                           "schema": [],
@@ -257,12 +273,12 @@
                           },
                           "schema": [],
                           "linkedService": {
-                            "name": "lh_vule_wwi",
+                            "name": "lh_vule_sonle_medallion",
                             "properties": {
                               "type": "Lakehouse",
                               "typeProperties": {
-                                "artifactId": "69671e72-3478-4e81-bf8d-f4ba45f93a50",
-                                "workspaceId": "189de9a5-831a-46c8-ba54-fed84eb1e387",
+                                "artifactId": "126b4070-60a9-bea6-4c54-57c9233f4c6f",
+                                "workspaceId": "00000000-0000-0000-0000-000000000000",
                                 "rootFolder": "Files"
                               },
                               "annotations": []
