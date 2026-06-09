@@ -23,16 +23,18 @@
 # CELL ********************
 
 # ============================================================
-# DEDICATED SILVER NOTEBOOK — SALES_ORDERS (DELTA LOAD)
+# DEDICATED SILVER NOTEBOOK — APPLICATION_PEOPLE (FULL LOAD)
 # ============================================================
 
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 from pyspark.sql.types import TimestampType, StringType, DateType
 
-# ======================= BỔ SUNG CLEANING =======================
+# ============================================================
+# BỔ SUNG: Hàm cleaning
+# ============================================================
 EXCLUDE_COLS = {
-    "Comments", "DeliveryInstructions", "InternalComments"
+    "HashedPassword", "Photo", "CustomFields", "OtherLanguages"
 }
 
 def clean_strings(df):
@@ -57,38 +59,37 @@ def drop_unwanted_cols(df):
     if all_drop:
         df = df.drop(*all_drop)
     return df
-# =================================================================
+# ============================================================
 
-# ── 1. Hardcode sẵn (Chuyển sang dnyamic params sau) ──────────────────────
-TARGET_OBJECT = "Sales_Orders"
+# ── 1. Hardcode ────────────────────────────────────────────────────────────
+TARGET_OBJECT = "Application_People"
 METADATA_DB   = "lh_vule_sonle_medallion"
 CONFIG_TABLE  = f"{METADATA_DB}.etl.config_silver_tables"
 silver_table  = f"{METADATA_DB}.silver.{TARGET_OBJECT}"
 
-print(f"[INFO] Bắt đầu kích hoạt Pipeline chuyên biệt cho thực thể: {silver_table}")
+print(f"[INFO] Bắt đầu pipeline full load cho {silver_table}")
 
-# ── 2. Lấy tham số từ config table ─────────────
+# ── 2. Lấy cấu hình ───────────────────────────────────────────────────────
 config_row = (
     spark.table(CONFIG_TABLE)
     .filter((F.col("source_object") == TARGET_OBJECT) & (F.col("is_active") == 1))
     .collect()
 )
 if not config_row:
-    raise RuntimeError(f"[ERROR] Không tìm thấy dòng cấu hình cho '{TARGET_OBJECT}' trong bảng {CONFIG_TABLE}!")
+    raise RuntimeError(f"[ERROR] Không tìm thấy config cho '{TARGET_OBJECT}'")
 
 metadata = config_row[0]
 source_system = metadata["source_system"]
 business_key  = metadata["business_key"]
 column_list   = metadata["column_list"]
-load_type     = metadata["load_type"]
 
 business_keys = [k.strip() for k in business_key.split(",")]
 business_columns = sorted([c.strip() for c in column_list.split(",")])
 
 bronze_path = f"Files/Bronze/{source_system}/{TARGET_OBJECT}"
-print(f"[INFO] Đường dẫn Bronze hiện tại: {bronze_path}")
+print(f"[INFO] Bronze path: {bronze_path}")
 
-# ── 3. ĐỌC BRONZE THEO WATERMARK & CÔ LẬP SNAPSHOT MỚI NHẤT ─────────────────
+# ── 3. Đọc Bronze theo watermark ──────────────────────────────────────────
 WATERMARK_TABLE = f"{METADATA_DB}.etl.watermark"
 
 watermark_row = (
@@ -100,46 +101,47 @@ watermark_row = (
     .collect()
 )
 max_audit_ts = watermark_row[0]["max_audit_ts"] if watermark_row else None
-print(f"[INFO] Silver watermark hiện tại của {TARGET_OBJECT}: {max_audit_ts}")
+print(f"[INFO] Watermark hiện tại: {max_audit_ts}")
 
 if max_audit_ts is None:
-    bronze_raw_df = spark.read.format("parquet").load(bronze_path)
+    bronze_raw_df = spark.read.parquet(bronze_path)
 else:
     load_year = max_audit_ts.year
     load_month = max_audit_ts.month
     load_day = max_audit_ts.day
     bronze_raw_df = (
-        spark.read.format("parquet")
-        .load(bronze_path)
+        spark.read.parquet(bronze_path)
         .filter(
             (F.col("year") > load_year) |
             ((F.col("year") == load_year) & (F.col("month") > load_month)) |
             ((F.col("year") == load_year) & (F.col("month") == load_month) & (F.col("day") >= load_day))
         )
-        .filter(F.col("audit_ts") > F.lit(max_audit_ts))
     )
 
 if bronze_raw_df.isEmpty():
-    raise RuntimeError(f"[INFO] Không có dữ liệu Bronze mới hơn watermark cho {TARGET_OBJECT}. Dừng tiến trình.")
+    raise RuntimeError(f"[INFO] Không có dữ liệu mới hơn watermark cho {TARGET_OBJECT}")
 
-# ======================= BỔ SUNG CLEANING =======================
-bronze_raw_df = clean_strings(bronze_raw_df)
-bronze_raw_df = cast_dates(bronze_raw_df)
-bronze_raw_df = drop_unwanted_cols(bronze_raw_df)
-# ================================================================
-
-latest_audit_ts = bronze_raw_df.select(F.max("audit_ts").alias("latest_audit_ts")).collect()[0]["latest_audit_ts"]
+latest_audit_ts = bronze_raw_df.agg(F.max("audit_ts")).collect()[0][0]
 if latest_audit_ts is None:
-    raise RuntimeError(f"[ERROR] Không tìm thấy audit_ts hợp lệ trong Bronze của {TARGET_OBJECT} tại {bronze_path}")
-print(f"[INFO] Latest Bronze audit_ts: {latest_audit_ts}")
+    raise RuntimeError(f"[ERROR] Không tìm thấy audit_ts trong Bronze")
+print(f"[INFO] Latest snapshot audit_ts: {latest_audit_ts}")
 
-if df_bronze_delta.isEmpty():
-    raise RuntimeError(f"[ERROR] Bronze delta của {TARGET_OBJECT} bị trống sau khi filter watermark.")
+df_bronze_snap = bronze_raw_df.filter(F.col("audit_ts") == F.lit(latest_audit_ts)).drop("year", "month", "day")
+if df_bronze_snap.isEmpty():
+    raise RuntimeError(f"[CRITICAL] Snapshot trống")
 
-# ── 4. DEDUPLICATE & ĐỔI MÃ HASH ─────────────────────────────
-w_dedup = Window.partitionBy(*business_keys).orderBy(F.col("audit_ts").desc() if "audit_ts" in df_bronze_delta.columns else F.lit(1))
+# ============================================================
+# BỔ SUNG: Cleaning
+# ============================================================
+df_bronze_snap = clean_strings(df_bronze_snap)
+df_bronze_snap = cast_dates(df_bronze_snap)
+df_bronze_snap = drop_unwanted_cols(df_bronze_snap)
+# ============================================================
+
+# ── 4. Dedup và hash ───────────────────────────────────────────────────────
+w_dedup = Window.partitionBy(*business_keys).orderBy(F.col("audit_ts").desc() if "audit_ts" in df_bronze_snap.columns else F.lit(1))
 df_staged = (
-    df_bronze_delta
+    df_bronze_snap
     .withColumn("_rn", F.row_number().over(w_dedup))
     .filter(F.col("_rn") == 1)
     .drop("_rn")
@@ -151,27 +153,29 @@ df_staged = df_staged.withColumn("hash_key", F.sha2(F.concat_ws("||", *key_expr)
 hash_expr = [F.coalesce(F.col(c).cast("string"), F.lit("NULL")) for c in business_columns if c in df_staged.columns]
 df_staged = df_staged.withColumn("row_hash", F.sha2(F.concat_ws("||", *hash_expr), 256))
 
-df_staged = df_staged.withColumn("audit_ts", F.current_timestamp()).cache()
+df_staged = (
+    df_staged
+    .withColumn("audit_ts", F.current_timestamp())
+    .withColumn("deleted_audit_ts", F.lit(None).cast(TimestampType()))
+).cache()
 
-# ── 5. ĐỐI CHIẾU VỚI CƠ SỞ DỮ LIỆU ĐÍCH SILVER ───────────────
+# ── 5. Đối chiếu với Silver (tombstone) ────────────────────────────────────
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {METADATA_DB}.silver")
 
 if not spark.catalog.tableExists(silver_table):
-    print(f"[FIRST-RUN] Bảng '{silver_table}' chưa tồn tại. Tiến hành khởi tạo...")
+    print(f"[FIRST-RUN] Tạo bảng {silver_table}")
     df_to_insert = df_staged
 else:
-    print(f"Bảng '{silver_table}' đã tồn tại. Đối chiếu thay đổi...")
     df_staged_keys = df_staged.select("hash_key").distinct()
     w_rank = Window.partitionBy("hash_key").orderBy(F.col("audit_ts").desc())
     df_silver_active = (
         spark.table(silver_table)
         .join(F.broadcast(df_staged_keys), on="hash_key", how="inner")
         .withColumn("_rn", F.row_number().over(w_rank))
-        .filter(F.col("_rn") == 1)
+        .filter((F.col("_rn") == 1) & F.col("deleted_audit_ts").isNull())
         .select("hash_key", "row_hash")
         .cache()
     )
-
     df_new = df_staged.join(df_silver_active.select("hash_key"), on="hash_key", how="left_anti")
     df_changed = (
         df_staged
@@ -179,27 +183,43 @@ else:
         .filter(F.col("row_hash") != F.col("_silver_rh"))
         .drop("_silver_rh")
     )
-    df_to_insert = df_new.unionByName(df_changed)
+    df_upsert = df_new.unionByName(df_changed)
 
-# ── 6. THỰC THI GHI APPEND-ONLY VÀO DELTA LAKE ───────────────
+    # SoftDelete
+    df_all_active_silver = (
+        spark.table(silver_table)
+        .withColumn("_rn", F.row_number().over(w_rank))
+        .filter((F.col("_rn") == 1) & F.col("deleted_audit_ts").isNull())
+        .drop("_rn")
+    )
+    df_deleted_keys = df_all_active_silver.select("hash_key").distinct().join(df_staged_keys, on="hash_key", how="left_anti")
+    if not df_deleted_keys.isEmpty():
+        df_deleted = (
+            df_deleted_keys.join(df_all_active_silver, on="hash_key", how="inner")
+            .withColumn("deleted_audit_ts", F.current_timestamp())
+        ).select(df_upsert.columns)
+        df_upsert = df_upsert.unionByName(df_deleted)
+    df_to_insert = df_upsert
+
+# ── 6. Ghi vào Silver ──────────────────────────────────────────────────────
 rows_to_insert = df_to_insert.count() if df_to_insert else 0
 if rows_to_insert > 0:
     df_to_insert.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(silver_table)
-    print(f"[SUCCESS] Đã cập nhật {rows_to_insert} dòng vào {silver_table}.")
+    print(f"[SUCCESS] Đã ghi {rows_to_insert} dòng vào {silver_table}")
 else:
-    print("[INFO] Không có dữ liệu mới/thay đổi. Bỏ qua ghi.")
+    print("[INFO] Không có thay đổi")
 
 df_staged.unpersist()
 if 'df_silver_active' in locals(): df_silver_active.unpersist()
 
-# ── 7. APPEND WATERMARK MỚI CHO SILVER ───────────────────────
+# ── 7. Cập nhật watermark ──────────────────────────────────────────────────
 watermark_new_df = (
     spark.createDataFrame([("silver", TARGET_OBJECT, str(latest_audit_ts), "datetime")],
                           ["layer", "object_name", "key_1", "key_1_desc"])
     .withColumn("timestamp", F.current_timestamp())
 )
 watermark_new_df.write.format("delta").mode("append").saveAsTable(WATERMARK_TABLE)
-print(f"[SUCCESS] Đã append watermark mới cho {TARGET_OBJECT}: {latest_audit_ts}")
+print(f"[SUCCESS] Watermark updated: {latest_audit_ts}")
 
 # METADATA ********************
 

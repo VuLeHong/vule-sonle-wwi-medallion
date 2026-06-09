@@ -243,3 +243,46 @@ VALUES
 # META   "language": "python",
 # META   "language_group": "synapse_pyspark"
 # META }
+
+# CELL ********************
+
+from pyspark.sql import functions as F
+
+METADATA_DB = "lh_vule_sonle_medallion"
+CONFIG_TABLE = f"{METADATA_DB}.etl.config_silver_tables"
+
+# Định nghĩa column_list mới (đã bỏ DeliveryRun, RunPosition)
+new_column_list = (
+    "CustomerID, CustomerName, BillToCustomerID, CustomerCategoryID, "
+    "BuyingGroupID, PrimaryContactPersonID, AlternateContactPersonID, "
+    "DeliveryMethodID, DeliveryCityID, PostalCityID, CreditLimit, "
+    "AccountOpenedDate, StandardDiscountPercentage, IsStatementSent, "
+    "IsOnCreditHold, PaymentDays, PhoneNumber, FaxNumber, "
+    "WebsiteURL, DeliveryAddressLine1, DeliveryAddressLine2, "
+    "DeliveryPostalCode, DeliveryLocation, PostalAddressLine1, "
+    "PostalAddressLine2, PostalPostalCode, LastEditedBy, ValidFrom, ValidTo"
+)
+
+# Đọc config hiện tại
+df_config = spark.table(CONFIG_TABLE)
+
+# Cập nhật cột column_list cho config_id = 3
+df_updated = df_config.withColumn(
+    "column_list",
+    F.when(F.col("config_id") == 3, F.lit(new_column_list)).otherwise(F.col("column_list"))
+)
+
+# Ghi đè bảng config
+df_updated.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(CONFIG_TABLE)
+
+print("Đã cập nhật column_list cho Sales_Customers (removed DeliveryRun, RunPosition).")
+
+# Kiểm tra kết quả
+spark.table(CONFIG_TABLE).filter("config_id = 3").select("column_list").show(truncate=False)
+
+# METADATA ********************
+
+# META {
+# META   "language": "python",
+# META   "language_group": "synapse_pyspark"
+# META }
