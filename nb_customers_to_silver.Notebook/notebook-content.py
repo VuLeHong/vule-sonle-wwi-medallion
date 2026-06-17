@@ -32,7 +32,7 @@ from pyspark.sql.types import TimestampType, StringType, DateType
 
 # ======================= BỔ SUNG CLEANING (giữ nguyên toàn bộ logic cũ) =======================
 EXCLUDE_COLS = {
-    "website", "DeliveryRun", "RunPosition"
+    "websiteURL", "DeliveryRun", "RunPosition"
 }
 
 def clean_strings(df):
@@ -63,7 +63,7 @@ def drop_unwanted_cols(df):
 TARGET_OBJECT = "Sales_Customers"
 METADATA_DB   = "lh_vule_sonle_medallion"
 CONFIG_TABLE  = f"{METADATA_DB}.etl.config_silver_tables"
-silver_table  = f"{METADATA_DB}.silver.{TARGET_OBJECT}"
+silver_table  = f"{METADATA_DB}.Silver.{TARGET_OBJECT}"
 
 print(f"[INFO] Bắt đầu kích hoạt Pipeline chuyên biệt cho thực thể: {silver_table}")
 
@@ -162,7 +162,7 @@ df_staged = (
 ).cache()
 
 # ── 5. ĐỐI CHIẾU VỚI CƠ SỞ DỮ LIỆU ĐÍCH SILVER ───────────────
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {METADATA_DB}.silver")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {METADATA_DB}.Silver")
 
 if not spark.catalog.tableExists(silver_table):
     print(f"[FIRST-RUN] Bảng '{silver_table}' chưa tồn tại. Tiến hành khởi tạo...")

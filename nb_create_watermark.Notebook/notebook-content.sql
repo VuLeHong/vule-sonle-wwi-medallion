@@ -55,14 +55,14 @@
 -- MAGIC WATERMARK_TABLE = f"{METADATA_DB}.etl.watermark"
 -- MAGIC 
 -- MAGIC # Danh sách object_name cần xóa
--- MAGIC objects_to_delete = ["Sales_Customers"]
+-- MAGIC objects_to_delete = ["Fact_Sales"]
 -- MAGIC 
 -- MAGIC # Đọc toàn bộ watermark
 -- MAGIC df_watermark = spark.table(WATERMARK_TABLE)
 -- MAGIC 
 -- MAGIC # Lọc ra các dòng cần giữ lại (không thuộc danh sách xóa, hoặc nếu muốn chỉ xóa silver thì thêm điều kiện layer)
 -- MAGIC df_keep = df_watermark.filter(
--- MAGIC     ~((F.col("object_name").isin(objects_to_delete)) & (F.col("layer") == "silver"))
+-- MAGIC     ~((F.col("object_name").isin(objects_to_delete)) & (F.col("layer") == "gold"))
 -- MAGIC )
 -- MAGIC 
 -- MAGIC # Đếm số dòng bị xóa

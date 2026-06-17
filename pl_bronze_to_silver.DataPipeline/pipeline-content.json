@@ -4,8 +4,8 @@
       {
         "type": "TridentNotebook",
         "typeProperties": {
-          "notebookId": "0a3cf168-793b-4cb7-83d2-382a3df730a7",
-          "workspaceId": "174d659d-2d6e-4d9f-86df-19eba8ef09a7"
+          "notebookId": "3df730a7-382a-83d2-4cb7-793b0a3cf168",
+          "workspaceId": "00000000-0000-0000-0000-000000000000"
         },
         "policy": {
           "timeout": "0.12:00:00",
@@ -15,15 +15,13 @@
           "secureOutput": false
         },
         "name": "Customer",
-        "state": "Inactive",
-        "onInactiveMarkAs": "Succeeded",
         "dependsOn": []
       },
       {
         "type": "TridentNotebook",
         "typeProperties": {
-          "notebookId": "0403c4a5-fd9a-48f1-9841-6d66c031031f",
-          "workspaceId": "174d659d-2d6e-4d9f-86df-19eba8ef09a7"
+          "notebookId": "c031031f-6d66-9841-48f1-fd9a0403c4a5",
+          "workspaceId": "00000000-0000-0000-0000-000000000000"
         },
         "policy": {
           "timeout": "0.12:00:00",
@@ -33,8 +31,6 @@
           "secureOutput": false
         },
         "name": "Orders",
-        "state": "Inactive",
-        "onInactiveMarkAs": "Succeeded",
         "dependsOn": []
       },
       {
@@ -56,8 +52,8 @@
       {
         "type": "TridentNotebook",
         "typeProperties": {
-          "notebookId": "35577926-1aac-4911-b165-4e32d5e5b294",
-          "workspaceId": "174d659d-2d6e-4d9f-86df-19eba8ef09a7"
+          "notebookId": "d5e5b294-4e32-b165-4911-1aac35577926",
+          "workspaceId": "00000000-0000-0000-0000-000000000000"
         },
         "policy": {
           "timeout": "0.12:00:00",
@@ -67,15 +63,13 @@
           "secureOutput": false
         },
         "name": "CustomerCategories",
-        "state": "Inactive",
-        "onInactiveMarkAs": "Succeeded",
         "dependsOn": []
       },
       {
         "type": "TridentNotebook",
         "typeProperties": {
-          "notebookId": "836a25b6-35f3-417d-9ffd-5988c1bae99b",
-          "workspaceId": "174d659d-2d6e-4d9f-86df-19eba8ef09a7"
+          "notebookId": "c1bae99b-5988-9ffd-417d-35f3836a25b6",
+          "workspaceId": "00000000-0000-0000-0000-000000000000"
         },
         "policy": {
           "timeout": "0.12:00:00",
@@ -85,15 +79,13 @@
           "secureOutput": false
         },
         "name": "People",
-        "state": "Inactive",
-        "onInactiveMarkAs": "Succeeded",
         "dependsOn": []
       },
       {
         "type": "TridentNotebook",
         "typeProperties": {
-          "notebookId": "6f069d3b-0464-4eb1-8d74-d78b963c124a",
-          "workspaceId": "174d659d-2d6e-4d9f-86df-19eba8ef09a7"
+          "notebookId": "963c124a-d78b-8d74-4eb1-04646f069d3b",
+          "workspaceId": "00000000-0000-0000-0000-000000000000"
         },
         "policy": {
           "timeout": "0.12:00:00",
@@ -103,8 +95,6 @@
           "secureOutput": false
         },
         "name": "StockItems",
-        "state": "Inactive",
-        "onInactiveMarkAs": "Succeeded",
         "dependsOn": []
       }
     ]

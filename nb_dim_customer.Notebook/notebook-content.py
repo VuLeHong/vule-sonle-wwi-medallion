@@ -16,6 +16,9 @@
 # META           "id": "233f4c6f-57c9-4c54-bea6-60a9126b4070"
 # META         }
 # META       ]
+# META     },
+# META     "warehouse": {
+# META       "known_warehouses": []
 # META     }
 # META   }
 # META }
@@ -23,9 +26,12 @@
 # CELL ********************
 
 # ============================================================
-# DEDICATED GOLD NOTEBOOK — DIM_STOCKITEMS (SCD2)
-# Source: Silver.Warehouse_StockItems
-# Target: Gold.Dim_StockItems
+# GOLD NOTEBOOK — DIM_CUSTOMER (SCD2)
+# Source: Silver.Sales_Customers + Silver.Sales_CustomerCategories
+# SCD2 logic:
+#   - scd_from = audit_ts (thời điểm thay đổi trong Silver)
+#   - Recalculate SCD2 chain: scd_to, scd_version, scd_active
+#   - Xử lý inferred fill nếu có
 # ============================================================
 
 from pyspark.sql import functions as F
@@ -35,22 +41,20 @@ from delta.tables import DeltaTable
 from datetime import datetime
 
 # ============================================================
-# 1. Hardcode
+# 1. Hardcode parameters
 # ============================================================
 
 METADATA_DB = "lh_vule_sonle_medallion"
 
-SOURCE_OBJECT = "Warehouse_StockItems"
-TARGET_OBJECT = "Dim_StockItems"
+SOURCE_OBJECT = "Sales_Customers"
+TARGET_OBJECT = "Dim_Customer"
+TARGET_SCHEMA = "Gold"
 
 CONFIG_TABLE = f"{METADATA_DB}.etl.config_gold_tables"
 WATERMARK_TABLE = f"{METADATA_DB}.etl.watermark"
 
-TARGET_SCHEMA = "Gold"
-
+SKEY_COL = "customer_skey"
 DEFAULT_SCD_TO = "2999-12-31 00:00:00"
-
-SKEY_COL = "stockitem_skey"
 
 execution_start_time = datetime.now()
 
@@ -58,7 +62,7 @@ execution_start_time = datetime.now()
 no_new_data = False
 
 print("=" * 80)
-print("[START] Gold SCD2 load started")
+print("[START] Gold SCD2 load for DIM_CUSTOMER")
 print(f"[SOURCE_OBJECT] {SOURCE_OBJECT}")
 print(f"[TARGET_OBJECT] {TARGET_OBJECT}")
 print(f"[SKEY_COL] {SKEY_COL}")
@@ -95,16 +99,6 @@ def create_hash_expr(cols):
             ]
         ),
         256
-    )
-
-
-def source_change_ts_expr():
-    return F.greatest(
-        F.to_timestamp(F.col("audit_ts")),
-        F.coalesce(
-            F.to_timestamp(F.col("deleted_audit_ts")),
-            F.to_timestamp(F.col("audit_ts"))
-        )
     )
 
 
@@ -156,8 +150,18 @@ def align_to_target_columns(df, target_table: str):
     return df.select(*target_cols)
 
 
+def source_change_ts_expr():
+    return F.greatest(
+        F.to_timestamp(F.col("audit_ts")),
+        F.coalesce(
+            F.to_timestamp(F.col("deleted_audit_ts")),
+            F.to_timestamp(F.col("audit_ts"))
+        )
+    )
+
+
 # ============================================================
-# 3. Load Gold config
+# 3. Load Gold config cho Sales_Customers (primary)
 # ============================================================
 
 try:
@@ -180,7 +184,6 @@ try:
 
     source_schema = "Silver"
     source_object = get_row_value(metadata, "source_object", SOURCE_OBJECT)
-
     business_key = get_row_value(metadata, "business_key")
     column_list = get_row_value(metadata, "column_list")
 
@@ -193,13 +196,13 @@ try:
     if not configured_columns:
         raise RuntimeError("[ERROR] column_list trong config_gold_tables đang trống")
 
-    silver_table = f"{METADATA_DB}.{source_schema}.{source_object}"
+    silver_table_primary = f"{METADATA_DB}.{source_schema}.{source_object}"
     gold_table = f"{METADATA_DB}.{TARGET_SCHEMA}.{TARGET_OBJECT}"
 
-    print(f"[CONFIG] Source table : {silver_table}")
-    print(f"[CONFIG] Target table : {gold_table}")
-    print(f"[CONFIG] Business key : {business_keys}")
-    print(f"[CONFIG] SKey column  : {SKEY_COL}")
+    print(f"[CONFIG] Primary source table : {silver_table_primary}")
+    print(f"[CONFIG] Target table         : {gold_table}")
+    print(f"[CONFIG] Business key         : {business_keys}")
+    print(f"[CONFIG] SKey column          : {SKEY_COL}")
 
 except Exception as e:
     print(f"[FAILED] Load Gold config failed: {str(e)}")
@@ -207,7 +210,43 @@ except Exception as e:
 
 
 # ============================================================
-# 4. Load Gold watermark
+# 4. Đọc config cho lookup table (Sales_CustomerCategories)
+# ============================================================
+
+try:
+    lookup_config_row = (
+        spark.table(CONFIG_TABLE)
+        .filter(
+            (F.col("source_object") == "Sales_CustomerCategories") &
+            (F.col("is_active") == 1)
+        )
+        .limit(1)
+        .collect()
+    )
+
+    if not lookup_config_row:
+        raise RuntimeError("[ERROR] Không tìm thấy config cho Sales_CustomerCategories (lookup)")
+
+    lookup_meta = lookup_config_row[0]
+
+    lookup_business_key = get_row_value(lookup_meta, "business_key")
+    lookup_column_list = get_row_value(lookup_meta, "column_list")
+
+    lookup_business_keys = split_config_list(lookup_business_key)
+    lookup_columns = split_config_list(lookup_column_list)
+
+    silver_table_lookup = f"{METADATA_DB}.Silver.Sales_CustomerCategories"
+
+    print(f"[CONFIG] Lookup table        : {silver_table_lookup}")
+    print(f"[CONFIG] Lookup business key : {lookup_business_keys}")
+
+except Exception as e:
+    print(f"[FAILED] Load lookup config failed: {str(e)}")
+    raise
+
+
+# ============================================================
+# 5. Load Gold watermark
 # ============================================================
 
 try:
@@ -233,7 +272,7 @@ except Exception as e:
 
 
 # ============================================================
-# 5. Read changed records from Silver
+# 6. Read changed records from Silver Primary
 #    Nếu không có data mới:
 #    - Không raise SystemExit
 #    - Set no_new_data = True
@@ -241,28 +280,31 @@ except Exception as e:
 # ============================================================
 
 try:
-    if not table_exists(silver_table):
-        raise RuntimeError(f"[ERROR] Source Silver table không tồn tại: {silver_table}")
+    if not table_exists(silver_table_primary):
+        raise RuntimeError(f"[ERROR] Source Silver table không tồn tại: {silver_table_primary}")
 
-    df_silver = spark.table(silver_table)
+    if not table_exists(silver_table_lookup):
+        raise RuntimeError(f"[ERROR] Lookup Silver table không tồn tại: {silver_table_lookup}")
 
-    if "audit_ts" not in df_silver.columns:
-        raise RuntimeError("[ERROR] Silver table không có audit_ts để chạy watermark Gold")
+    df_primary = spark.table(silver_table_primary)
 
-    if "deleted_audit_ts" not in df_silver.columns:
-        df_silver = df_silver.withColumn(
+    if "audit_ts" not in df_primary.columns:
+        raise RuntimeError("[ERROR] Primary Silver table không có audit_ts để chạy watermark Gold")
+
+    if "deleted_audit_ts" not in df_primary.columns:
+        df_primary = df_primary.withColumn(
             "deleted_audit_ts",
             F.lit(None).cast(TimestampType())
         )
 
     if gold_watermark_ts is None:
-        df_changed_silver = df_silver
+        df_changed_primary = df_primary
     else:
-        df_changed_silver = df_silver.filter(
+        df_changed_primary = df_primary.filter(
             source_change_ts_expr() > F.lit(gold_watermark_ts)
         )
 
-    if df_changed_silver.isEmpty():
+    if df_changed_primary.isEmpty():
         no_new_data = True
 
         execution_end_time = datetime.now()
@@ -279,14 +321,14 @@ try:
 
     else:
         max_source_audit_ts = (
-            df_changed_silver
+            df_changed_primary
             .agg(F.max(source_change_ts_expr()).alias("max_ts"))
             .collect()[0]["max_ts"]
         )
 
-        changed_silver_count = df_changed_silver.count()
+        changed_primary_count = df_changed_primary.count()
 
-        print(f"[INFO] Changed records from Silver: {changed_silver_count}")
+        print(f"[INFO] Changed records from Silver: {changed_primary_count}")
         print(f"[INFO] Max source audit/deleted timestamp from Silver: {max_source_audit_ts}")
 
 except Exception as e:
@@ -306,7 +348,58 @@ if no_new_data:
 
 
 # ============================================================
-# 6. Prepare staged data
+# 7. Enrich changed records with lookup CustomerCategoryName
+# ============================================================
+
+try:
+    df_lookup = spark.table(silver_table_lookup)
+
+    if "audit_ts" not in df_lookup.columns:
+        raise RuntimeError("[ERROR] Lookup Silver table không có audit_ts")
+
+    if "deleted_audit_ts" not in df_lookup.columns:
+        df_lookup = df_lookup.withColumn(
+            "deleted_audit_ts",
+            F.lit(None).cast(TimestampType())
+        )
+
+    w_lookup = Window.partitionBy("hash_key").orderBy(F.col("audit_ts").desc())
+
+    df_lookup_current = (
+        df_lookup
+        .withColumn("_rn", F.row_number().over(w_lookup))
+        .filter(F.col("_rn") == 1)
+        .filter(F.col("deleted_audit_ts").isNull())
+        .drop("_rn")
+        .select(
+            F.col("CustomerCategoryID").alias("lookup_CustomerCategoryID"),
+            F.col("CustomerCategoryName")
+        )
+    )
+
+    df_enriched = (
+        df_changed_primary
+        .join(
+            F.broadcast(df_lookup_current),
+            df_changed_primary["CustomerCategoryID"] == df_lookup_current["lookup_CustomerCategoryID"],
+            how="left"
+        )
+        .withColumn(
+            "CustomerCategoryName",
+            F.coalesce(F.col("CustomerCategoryName"), F.lit("UNKNOWN"))
+        )
+        .drop("lookup_CustomerCategoryID")
+    )
+
+    print("[INFO] Enriched changed records with CustomerCategoryName")
+
+except Exception as e:
+    print(f"[FAILED] Enrich with lookup failed: {str(e)}")
+    raise
+
+
+# ============================================================
+# 8. Prepare staged data
 # ============================================================
 
 try:
@@ -314,24 +407,13 @@ try:
         business_keys + configured_columns + ["audit_ts"]
     ))
 
-    if "source_id" in df_changed_silver.columns and "source_id" not in selected_cols:
+    if "source_id" in df_enriched.columns and "source_id" not in selected_cols:
         selected_cols.append("source_id")
 
-    if "deleted_audit_ts" in df_changed_silver.columns and "deleted_audit_ts" not in selected_cols:
+    if "deleted_audit_ts" in df_enriched.columns and "deleted_audit_ts" not in selected_cols:
         selected_cols.append("deleted_audit_ts")
 
-    df_staged_raw = df_changed_silver.select(*selected_cols)
-
-    if "deleted_audit_ts" in df_staged_raw.columns:
-        df_staged_raw = df_staged_raw.withColumn(
-            "deleted_audit_ts",
-            F.to_timestamp(F.col("deleted_audit_ts"))
-        )
-    else:
-        df_staged_raw = df_staged_raw.withColumn(
-            "deleted_audit_ts",
-            F.lit(None).cast(TimestampType())
-        )
+    df_staged_raw = df_enriched.select(*selected_cols)
 
     df_staged_raw = df_staged_raw.withColumn(
         "hash_key",
@@ -343,11 +425,11 @@ try:
         "source_id",
         "deleted_audit_ts",
         "hash_key",
-        "row_hash",
+        "row_hash"
     }
 
     hash_columns = [
-        c for c in selected_cols
+        c for c in configured_columns
         if c in df_staged_raw.columns and c not in exclude_for_row_hash
     ]
 
@@ -384,7 +466,7 @@ except Exception as e:
 
 
 # ============================================================
-# 7. Create Gold schema if needed
+# 9. Create Gold schema if needed
 # ============================================================
 
 try:
@@ -397,7 +479,7 @@ except Exception as e:
 
 
 # ============================================================
-# 8. Fill inferred Dim record
+# 10. Fill inferred dimension records
 # ============================================================
 
 try:
@@ -417,12 +499,10 @@ try:
             "inferred_flag"
         }
 
-        missing_cols = [c for c in required_cols if c not in df_gold.columns]
+        missing = [c for c in required_cols if c not in df_gold.columns]
 
-        if missing_cols:
-            raise RuntimeError(
-                f"[ERROR] Gold dimension thiếu required columns: {missing_cols}"
-            )
+        if missing:
+            raise RuntimeError(f"[ERROR] Gold dimension thiếu required columns: {missing}")
 
         df_gold_active_inferred = (
             df_gold
@@ -457,6 +537,9 @@ try:
                 if c in df_inferred_to_fill.columns and c in df_gold.columns:
                     update_set[c] = f"s.`{c}`"
 
+            if "CustomerCategoryName" in df_inferred_to_fill.columns and "CustomerCategoryName" in df_gold.columns:
+                update_set["CustomerCategoryName"] = "s.CustomerCategoryName"
+
             DeltaTable.forName(spark, gold_table).alias("t") \
                 .merge(
                     df_inferred_to_fill.alias("s"),
@@ -465,11 +548,11 @@ try:
                 .whenMatchedUpdate(set=update_set) \
                 .execute()
 
-            df_inferred_keys = df_inferred_to_fill.select("hash_key").distinct()
+            filled_keys = df_inferred_to_fill.select("hash_key").distinct()
 
             df_staged_after_inferred = (
                 df_staged
-                .join(df_inferred_keys, on="hash_key", how="left_anti")
+                .join(filled_keys, on="hash_key", how="left_anti")
                 .cache()
             )
 
@@ -485,7 +568,7 @@ except Exception as e:
 
 
 # ============================================================
-# 9. Check new / changed / deleted records
+# 11. Phân loại new / changed / deleted
 # ============================================================
 
 try:
@@ -556,12 +639,12 @@ try:
     print(f"[CHECK] Inferred filled  : {inferred_filled_rows}")
 
 except Exception as e:
-    print(f"[FAILED] Check new / changed / deleted failed: {str(e)}")
+    print(f"[FAILED] Classify new/changed/deleted failed: {str(e)}")
     raise
 
 
 # ============================================================
-# 10. Build SCD2 insert dataframe
+# 12. Build SCD2 insert dataframe
 # ============================================================
 
 try:
@@ -589,13 +672,13 @@ except Exception as e:
 
 
 # ============================================================
-# 11. Insert new and changed records as SCD2 versions
+# 13. Insert new and changed records
 # ============================================================
 
 try:
-    df_to_insert = (
-        df_new_insert
-        .unionByName(df_changed_insert, allowMissingColumns=True)
+    df_to_insert = df_new_insert.unionByName(
+        df_changed_insert,
+        allowMissingColumns=True
     )
 
     insert_rows = df_to_insert.count()
@@ -642,7 +725,7 @@ except Exception as e:
 
 
 # ============================================================
-# 12. Handle deleted records from Silver tombstone
+# 14. Handle soft delete
 # ============================================================
 
 try:
@@ -678,7 +761,7 @@ except Exception as e:
 
 
 # ============================================================
-# 13. Recalculate SCD2 columns
+# 15. Recalculate SCD2 columns
 # ============================================================
 
 try:
@@ -725,6 +808,7 @@ try:
                 )
                 .otherwise(F.to_timestamp(F.lit(DEFAULT_SCD_TO)))
             )
+            
             .withColumn(
                 "_new_scd_active",
                 F.when(
@@ -772,7 +856,7 @@ except Exception as e:
 
 
 # ============================================================
-# 14. Update Gold watermark
+# 16. Update Gold watermark
 # ============================================================
 
 try:
@@ -798,13 +882,12 @@ except Exception as e:
 
 
 # ============================================================
-# 15. End log and cleanup
+# 17. Summary and cleanup
 # ============================================================
 
 try:
     execution_end_time = datetime.now()
-
-    total_updated_rows = int(changed_rows or 0) + int(inferred_filled_rows or 0)
+    total_updated_rows = changed_rows + inferred_filled_rows
 
     print("=" * 80)
     print("[SUCCESS] Gold SCD2 load completed")
@@ -823,24 +906,27 @@ try:
     print("=" * 80)
 
 finally:
-    if "df_staged" in locals():
-        df_staged.unpersist()
-    if "df_staged_after_inferred" in locals():
-        df_staged_after_inferred.unpersist()
-    if "df_non_deleted_staged" in locals():
-        df_non_deleted_staged.unpersist()
-    if "df_deleted_staged" in locals():
-        df_deleted_staged.unpersist()
-    if "df_new" in locals():
-        df_new.unpersist()
-    if "df_changed" in locals():
-        df_changed.unpersist()
-    if "df_deleted" in locals():
-        df_deleted.unpersist()
-    if "affected_keys_df" in locals():
-        affected_keys_df.unpersist()
+    for df_name in [
+        "df_staged",
+        "df_staged_after_inferred",
+        "df_non_deleted_staged",
+        "df_deleted_staged",
+        "df_new",
+        "df_changed",
+        "df_deleted",
+        "affected_keys_df"
+    ]:
+        if df_name in locals():
+            try:
+                locals()[df_name].unpersist()
+            except:
+                pass
+
     if "df_gold_active" in locals():
-        df_gold_active.unpersist()
+        try:
+            df_gold_active.unpersist()
+        except:
+            pass
 
 # METADATA ********************
 

@@ -23,9 +23,9 @@
 # CELL ********************
 
 # ============================================================
-# DEDICATED GOLD NOTEBOOK — DIM_STOCKITEMS (SCD2)
-# Source: Silver.Warehouse_StockItems
-# Target: Gold.Dim_StockItems
+# DEDICATED GOLD NOTEBOOK — DIM_PEOPLE (SCD1)
+# Source: Silver.Application_People
+# Target: Gold.Dim_People
 # ============================================================
 
 from pyspark.sql import functions as F
@@ -40,25 +40,25 @@ from datetime import datetime
 
 METADATA_DB = "lh_vule_sonle_medallion"
 
-SOURCE_OBJECT = "Warehouse_StockItems"
-TARGET_OBJECT = "Dim_StockItems"
+SOURCE_OBJECT = "Application_People"
+TARGET_OBJECT = "Dim_People"
 
 CONFIG_TABLE = f"{METADATA_DB}.etl.config_gold_tables"
 WATERMARK_TABLE = f"{METADATA_DB}.etl.watermark"
 
 TARGET_SCHEMA = "Gold"
 
-DEFAULT_SCD_TO = "2999-12-31 00:00:00"
+SKEY_COL = "person_skey"
 
-SKEY_COL = "stockitem_skey"
+DEFAULT_SCD_TO = "2999-12-31 00:00:00"
 
 execution_start_time = datetime.now()
 
-# Flag để stop notebook thành công khi không có data mới
+# Flag dùng để exit notebook thành công khi không có new data
 no_new_data = False
 
 print("=" * 80)
-print("[START] Gold SCD2 load started")
+print("[START] Gold SCD1 load started")
 print(f"[SOURCE_OBJECT] {SOURCE_OBJECT}")
 print(f"[TARGET_OBJECT] {TARGET_OBJECT}")
 print(f"[SKEY_COL] {SKEY_COL}")
@@ -95,16 +95,6 @@ def create_hash_expr(cols):
             ]
         ),
         256
-    )
-
-
-def source_change_ts_expr():
-    return F.greatest(
-        F.to_timestamp(F.col("audit_ts")),
-        F.coalesce(
-            F.to_timestamp(F.col("deleted_audit_ts")),
-            F.to_timestamp(F.col("audit_ts"))
-        )
     )
 
 
@@ -154,6 +144,16 @@ def align_to_target_columns(df, target_table: str):
             df = df.withColumn(c, F.lit(None))
 
     return df.select(*target_cols)
+
+
+def source_change_ts_expr():
+    return F.greatest(
+        F.to_timestamp(F.col("audit_ts")),
+        F.coalesce(
+            F.to_timestamp(F.col("deleted_audit_ts")),
+            F.to_timestamp(F.col("audit_ts"))
+        )
+    )
 
 
 # ============================================================
@@ -224,7 +224,6 @@ try:
     )
 
     gold_watermark_ts = watermark_row[0]["max_audit_ts"] if watermark_row else None
-
     print(f"[WATERMARK] Current Gold watermark: {gold_watermark_ts}")
 
 except Exception as e:
@@ -249,12 +248,6 @@ try:
     if "audit_ts" not in df_silver.columns:
         raise RuntimeError("[ERROR] Silver table không có audit_ts để chạy watermark Gold")
 
-    if "deleted_audit_ts" not in df_silver.columns:
-        df_silver = df_silver.withColumn(
-            "deleted_audit_ts",
-            F.lit(None).cast(TimestampType())
-        )
-
     if gold_watermark_ts is None:
         df_changed_silver = df_silver
     else:
@@ -268,7 +261,7 @@ try:
         execution_end_time = datetime.now()
 
         print("=" * 80)
-        print("[SUCCESS] Gold SCD2 load completed - No new data")
+        print("[SUCCESS] Gold SCD1 load completed - No new data")
         print("[STOP] No new data")
         print(f"[TARGET_OBJECT] {TARGET_OBJECT}")
         print(f"[SOURCE_OBJECT] {SOURCE_OBJECT}")
@@ -284,9 +277,6 @@ try:
             .collect()[0]["max_ts"]
         )
 
-        changed_silver_count = df_changed_silver.count()
-
-        print(f"[INFO] Changed records from Silver: {changed_silver_count}")
         print(f"[INFO] Max source audit/deleted timestamp from Silver: {max_source_audit_ts}")
 
 except Exception as e:
@@ -297,8 +287,8 @@ except Exception as e:
 # ============================================================
 # Stop notebook successfully if no new data
 # IMPORTANT:
-#   - Không dùng raise SystemExit
 #   - Không đặt notebookutils.notebook.exit trong try/except
+#   - Không dùng raise SystemExit
 # ============================================================
 
 if no_new_data:
@@ -322,16 +312,10 @@ try:
 
     df_staged_raw = df_changed_silver.select(*selected_cols)
 
-    if "deleted_audit_ts" in df_staged_raw.columns:
-        df_staged_raw = df_staged_raw.withColumn(
-            "deleted_audit_ts",
-            F.to_timestamp(F.col("deleted_audit_ts"))
-        )
-    else:
-        df_staged_raw = df_staged_raw.withColumn(
-            "deleted_audit_ts",
-            F.lit(None).cast(TimestampType())
-        )
+    df_staged_raw = df_staged_raw.withColumn(
+        "deleted_audit_ts",
+        F.to_timestamp(F.col("deleted_audit_ts"))
+    )
 
     df_staged_raw = df_staged_raw.withColumn(
         "hash_key",
@@ -360,7 +344,13 @@ try:
     )
 
     w_latest = Window.partitionBy("hash_key").orderBy(
-        source_change_ts_expr().desc(),
+        F.greatest(
+            F.to_timestamp(F.col("audit_ts")),
+            F.coalesce(
+                F.to_timestamp(F.col("deleted_audit_ts")),
+                F.to_timestamp(F.col("audit_ts"))
+            )
+        ).desc(),
         F.col("audit_ts").desc(),
         F.col("deleted_audit_ts").desc_nulls_last()
     )
@@ -397,23 +387,31 @@ except Exception as e:
 
 
 # ============================================================
-# 8. Fill inferred Dim record
+# 8. Check new / changed / deleted records
+#    SCD1: inferred records are handled as changed records
 # ============================================================
 
 try:
-    inferred_filled_rows = 0
+    df_non_deleted_staged = (
+        df_staged
+        .filter(F.col("deleted_audit_ts").isNull())
+        .cache()
+    )
 
-    if not table_exists(gold_table):
-        print("[INFERRED] Target table chưa tồn tại, skip step")
-        df_staged_after_inferred = df_staged
+    df_deleted_staged = (
+        df_staged
+        .filter(F.col("deleted_audit_ts").isNotNull())
+        .cache()
+    )
 
-    else:
+    if table_exists(gold_table):
         df_gold = spark.table(gold_table)
 
         required_cols = {
             "hash_key",
             SKEY_COL,
-            "scd_active",
+            "row_hash",
+            "deleted_audit_ts",
             "inferred_flag"
         }
 
@@ -424,91 +422,14 @@ try:
                 f"[ERROR] Gold dimension thiếu required columns: {missing_cols}"
             )
 
-        df_gold_active_inferred = (
+        df_gold_current = (
             df_gold
-            .filter(
-                (F.col("scd_active") == 1) &
-                (F.col("inferred_flag") == 1)
-            )
-            .select("hash_key", SKEY_COL)
-        )
-
-        df_inferred_to_fill = (
-            df_staged
-            .filter(F.col("deleted_audit_ts").isNull())
-            .join(df_gold_active_inferred, on="hash_key", how="inner")
-            .cache()
-        )
-
-        inferred_filled_rows = df_inferred_to_fill.count()
-
-        if inferred_filled_rows > 0:
-            print(f"[INFERRED] Fill inferred rows: {inferred_filled_rows}")
-
-            update_set = {
-                "audit_ts": "s.audit_ts",
-                "updated_audit_ts": "current_timestamp()",
-                "deleted_audit_ts": "s.deleted_audit_ts",
-                "row_hash": "s.row_hash",
-                "inferred_flag": "0"
-            }
-
-            for c in configured_columns:
-                if c in df_inferred_to_fill.columns and c in df_gold.columns:
-                    update_set[c] = f"s.`{c}`"
-
-            DeltaTable.forName(spark, gold_table).alias("t") \
-                .merge(
-                    df_inferred_to_fill.alias("s"),
-                    f"t.{SKEY_COL} = s.{SKEY_COL}"
-                ) \
-                .whenMatchedUpdate(set=update_set) \
-                .execute()
-
-            df_inferred_keys = df_inferred_to_fill.select("hash_key").distinct()
-
-            df_staged_after_inferred = (
-                df_staged
-                .join(df_inferred_keys, on="hash_key", how="left_anti")
-                .cache()
-            )
-
-        else:
-            print("[INFERRED] No inferred rows to fill")
-            df_staged_after_inferred = df_staged
-
-        df_inferred_to_fill.unpersist()
-
-except Exception as e:
-    print(f"[FAILED] Fill inferred dimension failed: {str(e)}")
-    raise
-
-
-# ============================================================
-# 9. Check new / changed / deleted records
-# ============================================================
-
-try:
-    df_non_deleted_staged = (
-        df_staged_after_inferred
-        .filter(F.col("deleted_audit_ts").isNull())
-        .cache()
-    )
-
-    df_deleted_staged = (
-        df_staged_after_inferred
-        .filter(F.col("deleted_audit_ts").isNotNull())
-        .cache()
-    )
-
-    if table_exists(gold_table):
-        df_gold_active = (
-            spark.table(gold_table)
-            .filter(F.col("scd_active") == 1)
             .select(
                 "hash_key",
                 SKEY_COL,
-                F.col("row_hash").alias("_gold_row_hash")
+                F.col("row_hash").alias("_gold_row_hash"),
+                F.col("deleted_audit_ts").alias("_gold_deleted_audit_ts"),
+                F.col("inferred_flag").alias("_gold_inferred_flag")
             )
             .cache()
         )
@@ -516,7 +437,7 @@ try:
         df_new = (
             df_non_deleted_staged
             .join(
-                df_gold_active.select("hash_key"),
+                df_gold_current.select("hash_key"),
                 on="hash_key",
                 how="left_anti"
             )
@@ -525,16 +446,24 @@ try:
 
         df_changed = (
             df_non_deleted_staged
-            .join(df_gold_active, on="hash_key", how="inner")
-            .filter(F.col("row_hash") != F.col("_gold_row_hash"))
-            .drop("_gold_row_hash", SKEY_COL)
+            .join(df_gold_current, on="hash_key", how="inner")
+            .filter(
+                (F.col("row_hash") != F.col("_gold_row_hash")) |
+                (F.col("_gold_deleted_audit_ts").isNotNull()) |
+                (F.col("_gold_inferred_flag") == 1)
+            )
+            .drop(
+                "_gold_row_hash",
+                "_gold_deleted_audit_ts",
+                "_gold_inferred_flag"
+            )
             .cache()
         )
 
         df_deleted = (
             df_deleted_staged
             .join(
-                df_gold_active.select("hash_key", SKEY_COL),
+                df_gold_current.select("hash_key", SKEY_COL),
                 on="hash_key",
                 how="inner"
             )
@@ -553,7 +482,6 @@ try:
     print(f"[CHECK] New records      : {new_rows}")
     print(f"[CHECK] Changed records  : {changed_rows}")
     print(f"[CHECK] Deleted records  : {deleted_rows}")
-    print(f"[CHECK] Inferred filled  : {inferred_filled_rows}")
 
 except Exception as e:
     print(f"[FAILED] Check new / changed / deleted failed: {str(e)}")
@@ -561,83 +489,124 @@ except Exception as e:
 
 
 # ============================================================
-# 10. Build SCD2 insert dataframe
+# 9. Build SCD1 insert dataframe
 # ============================================================
 
 try:
-    def build_scd2_insert_df(df_input):
-        return (
-            df_input
-            .withColumn("updated_audit_ts", F.lit(None).cast(TimestampType()))
-            .withColumn("scd_start", F.current_timestamp())
-            .withColumn("scd_from", F.to_timestamp(F.col("audit_ts")))
-            .withColumn("scd_to", F.to_timestamp(F.lit(DEFAULT_SCD_TO)))
-            .withColumn("scd_active", F.lit(1).cast(IntegerType()))
-            .withColumn("scd_version", F.lit(1).cast(IntegerType()))
-            .withColumn("inferred_flag", F.lit(0).cast(IntegerType()))
-        )
-
-    df_new_insert = build_scd2_insert_df(df_new)
-    df_changed_insert = build_scd2_insert_df(df_changed)
+    df_new_insert = (
+        df_new
+        .withColumn("updated_audit_ts", F.lit(None).cast(TimestampType()))
+        .withColumn("scd_start", F.current_timestamp())
+        .withColumn("scd_active", F.lit(1).cast(IntegerType()))
+        .withColumn("scd_version", F.lit(1).cast(IntegerType()))
+        .withColumn("inferred_flag", F.lit(0).cast(IntegerType()))
+    )
 
     print(f"[INSERT NEW] Prepared rows: {new_rows}")
-    print(f"[INSERT CHANGED] Prepared rows: {changed_rows}")
 
 except Exception as e:
-    print(f"[FAILED] Build SCD2 insert dataframe failed: {str(e)}")
+    print(f"[FAILED] Build SCD1 insert dataframe failed: {str(e)}")
     raise
 
 
 # ============================================================
-# 11. Insert new and changed records as SCD2 versions
+# 10. Insert new records
 # ============================================================
 
 try:
-    df_to_insert = (
-        df_new_insert
-        .unionByName(df_changed_insert, allowMissingColumns=True)
-    )
-
-    insert_rows = df_to_insert.count()
-
-    if insert_rows > 0:
-        df_to_insert = add_surrogate_key(
-            df_to_insert,
+    if new_rows > 0:
+        df_new_insert = add_surrogate_key(
+            df_new_insert,
             gold_table,
             SKEY_COL,
             business_keys
         )
 
         ordered_cols = [SKEY_COL] + [
-            c for c in df_to_insert.columns
+            c for c in df_new_insert.columns
             if c != SKEY_COL
         ]
 
-        df_to_insert = df_to_insert.select(*ordered_cols)
+        df_new_insert = df_new_insert.select(*ordered_cols)
 
         if table_exists(gold_table):
-            df_to_insert = align_to_target_columns(df_to_insert, gold_table)
+            df_new_insert = align_to_target_columns(df_new_insert, gold_table)
 
-            df_to_insert.write \
+            df_new_insert.write \
                 .format("delta") \
                 .mode("append") \
                 .option("mergeSchema", "true") \
                 .saveAsTable(gold_table)
 
         else:
-            df_to_insert.write \
+            df_new_insert.write \
                 .format("delta") \
                 .mode("overwrite") \
                 .option("overwriteSchema", "true") \
                 .saveAsTable(gold_table)
 
-        print(f"[INSERT SCD2] Inserted rows: {insert_rows}")
+        print(f"[INSERT SCD1] Inserted new rows: {new_rows}")
 
     else:
-        print("[INSERT SCD2] No new or changed records to insert")
+        print("[INSERT SCD1] No new records to insert")
 
 except Exception as e:
-    print(f"[FAILED] Insert SCD2 records failed: {str(e)}")
+    print(f"[FAILED] Insert SCD1 new records failed: {str(e)}")
+    raise
+
+
+# ============================================================
+# 11. Update changed records directly
+#     SCD1 overwrite:
+#     - changed attribute
+#     - restored soft-deleted record
+#     - inferred_flag = 1 record
+# ============================================================
+
+try:
+    if changed_rows > 0 and table_exists(gold_table):
+        df_changed_update = (
+            df_changed
+            .dropDuplicates(["hash_key"])
+            .cache()
+        )
+
+        df_gold = spark.table(gold_table)
+
+        update_set = {
+            "audit_ts": "s.audit_ts",
+            "updated_audit_ts": "current_timestamp()",
+            "deleted_audit_ts": "s.deleted_audit_ts",
+            "row_hash": "s.row_hash",
+            "inferred_flag": "0",
+            "scd_active": "1",
+            "scd_version": "1"
+        }
+
+        if "source_id" in df_changed_update.columns and "source_id" in df_gold.columns:
+            update_set["source_id"] = "s.source_id"
+
+        for c in configured_columns:
+            if c in df_changed_update.columns and c in df_gold.columns:
+                update_set[c] = f"s.`{c}`"
+
+        DeltaTable.forName(spark, gold_table).alias("t") \
+            .merge(
+                df_changed_update.alias("s"),
+                "t.hash_key = s.hash_key"
+            ) \
+            .whenMatchedUpdate(set=update_set) \
+            .execute()
+
+        print(f"[UPDATE SCD1] Updated changed rows: {changed_rows}")
+
+        df_changed_update.unpersist()
+
+    else:
+        print("[UPDATE SCD1] No changed records to update")
+
+except Exception as e:
+    print(f"[FAILED] Update SCD1 changed records failed: {str(e)}")
     raise
 
 
@@ -650,16 +619,16 @@ try:
         df_deleted_update = (
             df_deleted
             .select(
-                SKEY_COL,
+                "hash_key",
                 F.col("deleted_audit_ts").alias("_deleted_audit_ts")
             )
-            .dropDuplicates([SKEY_COL])
+            .dropDuplicates(["hash_key"])
         )
 
         DeltaTable.forName(spark, gold_table).alias("t") \
             .merge(
                 df_deleted_update.alias("s"),
-                f"t.{SKEY_COL} = s.{SKEY_COL}"
+                "t.hash_key = s.hash_key"
             ) \
             .whenMatchedUpdate(set={
                 "deleted_audit_ts": "s._deleted_audit_ts",
@@ -667,7 +636,7 @@ try:
             }) \
             .execute()
 
-        print(f"[DELETE] Marked deleted active rows: {deleted_rows}")
+        print(f"[DELETE] Marked deleted rows: {deleted_rows}")
 
     else:
         print("[DELETE] No deleted records to process")
@@ -678,101 +647,7 @@ except Exception as e:
 
 
 # ============================================================
-# 13. Recalculate SCD2 columns
-# ============================================================
-
-try:
-    affected_keys_df = (
-        df_new.select("hash_key")
-        .unionByName(df_changed.select("hash_key"))
-        .unionByName(df_deleted.select("hash_key"))
-        .distinct()
-        .cache()
-    )
-
-    affected_key_count = affected_keys_df.count()
-
-    if affected_key_count > 0 and table_exists(gold_table):
-        print(f"[RECALC] Affected business keys: {affected_key_count}")
-
-        df_target_affected = (
-            spark.table(gold_table)
-            .join(F.broadcast(affected_keys_df), on="hash_key", how="inner")
-        )
-
-        w_order = Window.partitionBy("hash_key").orderBy(
-            F.col("scd_from").asc(),
-            F.col("audit_ts").asc(),
-            F.col(SKEY_COL).asc()
-        )
-
-        w_part = Window.partitionBy("hash_key")
-
-        df_recalc = (
-            df_target_affected
-            .withColumn("_rn", F.row_number().over(w_order))
-            .withColumn("_next_scd_from", F.lead("scd_from").over(w_order))
-            .withColumn("_min_scd_start", F.min("scd_start").over(w_part))
-            .withColumn(
-                "_new_scd_to",
-                F.when(
-                    F.col("deleted_audit_ts").isNotNull(),
-                    F.col("deleted_audit_ts")
-                )
-                .when(
-                    F.col("_next_scd_from").isNotNull(),
-                    F.col("_next_scd_from")
-                )
-                .otherwise(F.to_timestamp(F.lit(DEFAULT_SCD_TO)))
-            )
-            .withColumn(
-                "_new_scd_active",
-                F.when(
-                    F.col("deleted_audit_ts").isNotNull(),
-                    F.lit(0)
-                )
-                .when(
-                    F.col("_next_scd_from").isNull(),
-                    F.lit(1)
-                )
-                .otherwise(F.lit(0))
-            )
-            .select(
-                SKEY_COL,
-                F.col("_min_scd_start").alias("new_scd_start"),
-                F.col("scd_from").alias("new_scd_from"),
-                F.col("_new_scd_to").alias("new_scd_to"),
-                F.col("_new_scd_active").cast(IntegerType()).alias("new_scd_active"),
-                F.col("_rn").cast(IntegerType()).alias("new_scd_version")
-            )
-        )
-
-        DeltaTable.forName(spark, gold_table).alias("t") \
-            .merge(
-                df_recalc.alias("s"),
-                f"t.{SKEY_COL} = s.{SKEY_COL}"
-            ) \
-            .whenMatchedUpdate(set={
-                "scd_start": "s.new_scd_start",
-                "scd_from": "s.new_scd_from",
-                "scd_to": "s.new_scd_to",
-                "scd_active": "s.new_scd_active",
-                "scd_version": "s.new_scd_version"
-            }) \
-            .execute()
-
-        print("[RECALC] SCD2 columns recalculated")
-
-    else:
-        print("[RECALC] No affected keys")
-
-except Exception as e:
-    print(f"[FAILED] Recalculate SCD2 columns failed: {str(e)}")
-    raise
-
-
-# ============================================================
-# 14. Update Gold watermark
+# 13. Update Gold watermark
 # ============================================================
 
 try:
@@ -798,16 +673,14 @@ except Exception as e:
 
 
 # ============================================================
-# 15. End log and cleanup
+# 14. End log and cleanup
 # ============================================================
 
 try:
     execution_end_time = datetime.now()
 
-    total_updated_rows = int(changed_rows or 0) + int(inferred_filled_rows or 0)
-
     print("=" * 80)
-    print("[SUCCESS] Gold SCD2 load completed")
+    print("[SUCCESS] Gold SCD1 load completed")
     print(f"[TARGET_OBJECT] {TARGET_OBJECT}")
     print(f"[SOURCE_OBJECT] {SOURCE_OBJECT}")
     print(f"[START_TIME] {execution_start_time}")
@@ -816,8 +689,7 @@ try:
     print("-" * 80)
     print(f"[SUMMARY] New rows          : {new_rows}")
     print(f"[SUMMARY] Changed rows      : {changed_rows}")
-    print(f"[SUMMARY] Inferred filled   : {inferred_filled_rows}")
-    print(f"[SUMMARY] Updated rows      : {total_updated_rows}")
+    print(f"[SUMMARY] Updated rows      : {changed_rows}")
     print(f"[SUMMARY] Deleted rows      : {deleted_rows}")
     print(f"[SUMMARY] Watermark updated : {max_source_audit_ts}")
     print("=" * 80)
@@ -825,8 +697,6 @@ try:
 finally:
     if "df_staged" in locals():
         df_staged.unpersist()
-    if "df_staged_after_inferred" in locals():
-        df_staged_after_inferred.unpersist()
     if "df_non_deleted_staged" in locals():
         df_non_deleted_staged.unpersist()
     if "df_deleted_staged" in locals():
@@ -837,10 +707,8 @@ finally:
         df_changed.unpersist()
     if "df_deleted" in locals():
         df_deleted.unpersist()
-    if "affected_keys_df" in locals():
-        affected_keys_df.unpersist()
-    if "df_gold_active" in locals():
-        df_gold_active.unpersist()
+    if "df_gold_current" in locals():
+        df_gold_current.unpersist()
 
 # METADATA ********************
 

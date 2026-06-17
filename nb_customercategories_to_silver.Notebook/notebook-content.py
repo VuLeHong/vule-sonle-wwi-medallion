@@ -64,7 +64,7 @@ def drop_unwanted_cols(df):
 TARGET_OBJECT = "Sales_CustomerCategories"
 METADATA_DB   = "lh_vule_sonle_medallion"
 CONFIG_TABLE  = f"{METADATA_DB}.etl.config_silver_tables"
-silver_table  = f"{METADATA_DB}.silver.{TARGET_OBJECT}"
+silver_table  = f"{METADATA_DB}.Silver.{TARGET_OBJECT}"
 
 print(f"[INFO] Bắt đầu pipeline full load cho {silver_table}")
 
@@ -159,7 +159,7 @@ df_staged = (
 ).cache()
 
 # ── 5. Đối chiếu với Silver (tombstone) ────────────────────────────────────
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {METADATA_DB}.silver")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {METADATA_DB}.Silver")
 
 if not spark.catalog.tableExists(silver_table):
     print(f"[FIRST-RUN] Tạo bảng {silver_table}")
