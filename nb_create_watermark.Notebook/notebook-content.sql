@@ -41,3 +41,38 @@
 -- META   "language": "sparksql",
 -- META   "language_group": "synapse_pyspark"
 -- META }
+
+-- MARKDOWN ********************
+
+-- Code xoá dòng wtm để run lại bảng
+
+-- CELL ********************
+
+-- MAGIC %%pyspark
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC 
+-- MAGIC METADATA_DB = "lh_vule_sonle_medallion"
+-- MAGIC WATERMARK_TABLE = f"{METADATA_DB}.etl.watermark"
+-- MAGIC 
+-- MAGIC # Đọc toàn bộ watermark
+-- MAGIC df_watermark = spark.table(WATERMARK_TABLE)
+-- MAGIC 
+-- MAGIC # Giữ lại tất cả các dòng KHÔNG thuộc layer = 'bronze'
+-- MAGIC df_keep = df_watermark.filter(F.col("layer") != "bronze")
+-- MAGIC 
+-- MAGIC # Số dòng đã bị xóa
+-- MAGIC deleted_count = df_watermark.count() - df_keep.count()
+-- MAGIC 
+-- MAGIC if deleted_count > 0:
+-- MAGIC     # Ghi đè bảng watermark bằng dữ liệu đã lọc
+-- MAGIC     df_keep.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(WATERMARK_TABLE)
+-- MAGIC     print(f"Đã xóa {deleted_count} dòng watermark của layer='bronze'")
+-- MAGIC else:
+-- MAGIC     print("Không có dòng watermark nào của layer='bronze' để xóa.")
+
+-- METADATA ********************
+
+-- META {
+-- META   "language": "python",
+-- META   "language_group": "synapse_pyspark"
+-- META }

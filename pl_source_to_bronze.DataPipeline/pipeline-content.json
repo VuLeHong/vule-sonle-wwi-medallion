@@ -70,7 +70,7 @@
                           "enableVertiParquet": true
                         },
                         "storeSettings": {
-                          "type": "LakehouseWriteSettings"
+                          "type": "AzureBlobStorageWriteSettings"
                         },
                         "datasetSettings": {
                           "type": "Parquet",
@@ -145,7 +145,7 @@
                         },
                         "schema": [],
                         "externalReferences": {
-                          "connection": "a26c8e45-e7b1-4185-9574-3ebdabe07859"
+                          "connection": "e611ddf0-ae01-4117-8b81-f0b914e87884"
                         },
                         "annotations": []
                       },
@@ -212,6 +212,22 @@
                         },
                         "partitionOption": "None",
                         "queryTimeout": "02:00:00",
+                        "additionalColumns": [
+                          {
+                            "name": "source_id",
+                            "value": {
+                              "value": "@item().source_system",
+                              "type": "Expression"
+                            }
+                          },
+                          {
+                            "name": "audit_ts",
+                            "value": {
+                              "value": "@utcNow()",
+                              "type": "Expression"
+                            }
+                          }
+                        ],
                         "datasetSettings": {
                           "type": "DataWarehouseTable",
                           "schema": [],
@@ -257,12 +273,12 @@
                           },
                           "schema": [],
                           "linkedService": {
-                            "name": "lh_vule_wwi",
+                            "name": "lh_vule_sonle_medallion",
                             "properties": {
                               "type": "Lakehouse",
                               "typeProperties": {
-                                "artifactId": "69671e72-3478-4e81-bf8d-f4ba45f93a50",
-                                "workspaceId": "189de9a5-831a-46c8-ba54-fed84eb1e387",
+                                "artifactId": "126b4070-60a9-bea6-4c54-57c9233f4c6f",
+                                "workspaceId": "00000000-0000-0000-0000-000000000000",
                                 "rootFolder": "Files"
                               },
                               "annotations": []
@@ -370,7 +386,7 @@
           "source": {
             "type": "SqlServerSource",
             "sqlReaderQuery": {
-              "value": "SELECT\n    *\nFROM\n    [etl].[config_bronze_tables]\nWHERE \n    is_active = 1",
+              "value": "@if(\n    equals(pipeline().parameters.SourceObject, 'ALL'),\n    'SELECT * FROM [etl].[config_tables] WHERE layer = ''Bronze'' AND is_active = 1',\n    concat(\n        'SELECT * FROM [etl].[config_tables] WHERE layer = ''Bronze'' AND is_active = 1 AND source_object = ''',\n        pipeline().parameters.SourceObject,\n        ''''\n    )\n)",
               "type": "Expression"
             },
             "partitionOption": "None",
@@ -378,9 +394,12 @@
           },
           "datasetSettings": {
             "type": "SqlServerTable",
+            "typeProperties": {
+              "database": "lh_vule_sonle_medallion"
+            },
             "schema": [],
             "externalReferences": {
-              "connection": "a26c8e45-e7b1-4185-9574-3ebdabe07859"
+              "connection": "e611ddf0-ae01-4117-8b81-f0b914e87884"
             },
             "annotations": []
           },
@@ -396,6 +415,12 @@
         "name": "Get_config",
         "dependsOn": []
       }
-    ]
+    ],
+    "parameters": {
+      "SourceObject": {
+        "type": "string",
+        "defaultValue": "ALL"
+      }
+    }
   }
 }

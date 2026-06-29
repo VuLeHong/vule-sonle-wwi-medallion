@@ -1,7 +1,7 @@
 <Project DefaultTargets="Build">
   <Sdk Name="Microsoft.Build.Sql" Version="0.1.19-preview" />
   <PropertyGroup>
-    <Name>wh-vule-sonle-WWI-medallion</Name>
+    <Name>StagingWarehouseForDataflows_20260625144253</Name>
     <DSP>Microsoft.Data.Tools.Schema.Sql.SqlDwUnifiedDatabaseSchemaProvider</DSP>
     <ModelCollation>1033, CS</ModelCollation>
     <DefaultCollation>Latin1_General_100_BIN2_UTF8</DefaultCollation>
