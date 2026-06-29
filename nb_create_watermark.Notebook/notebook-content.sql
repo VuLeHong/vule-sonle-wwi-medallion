@@ -54,25 +54,21 @@
 -- MAGIC METADATA_DB = "lh_vule_sonle_medallion"
 -- MAGIC WATERMARK_TABLE = f"{METADATA_DB}.etl.watermark"
 -- MAGIC 
--- MAGIC # Danh sách object_name cần xóa
--- MAGIC objects_to_delete = ["Fact_Sales"]
--- MAGIC 
 -- MAGIC # Đọc toàn bộ watermark
 -- MAGIC df_watermark = spark.table(WATERMARK_TABLE)
 -- MAGIC 
--- MAGIC # Lọc ra các dòng cần giữ lại (không thuộc danh sách xóa, hoặc nếu muốn chỉ xóa silver thì thêm điều kiện layer)
--- MAGIC df_keep = df_watermark.filter(
--- MAGIC     ~((F.col("object_name").isin(objects_to_delete)) & (F.col("layer") == "gold"))
--- MAGIC )
+-- MAGIC # Giữ lại tất cả các dòng KHÔNG thuộc layer = 'bronze'
+-- MAGIC df_keep = df_watermark.filter(F.col("layer") != "bronze")
 -- MAGIC 
--- MAGIC # Đếm số dòng bị xóa
+-- MAGIC # Số dòng đã bị xóa
 -- MAGIC deleted_count = df_watermark.count() - df_keep.count()
+-- MAGIC 
 -- MAGIC if deleted_count > 0:
 -- MAGIC     # Ghi đè bảng watermark bằng dữ liệu đã lọc
 -- MAGIC     df_keep.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(WATERMARK_TABLE)
--- MAGIC     print(f"Đã xóa {deleted_count} dòng watermark (layer='silver' và object_name in {objects_to_delete})")
+-- MAGIC     print(f"Đã xóa {deleted_count} dòng watermark của layer='bronze'")
 -- MAGIC else:
--- MAGIC     print("Không có dòng nào thỏa mãn điều kiện xóa.")
+-- MAGIC     print("Không có dòng watermark nào của layer='bronze' để xóa.")
 
 -- METADATA ********************
 

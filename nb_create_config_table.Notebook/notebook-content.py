@@ -493,39 +493,279 @@ spark.table(CONFIG_TABLE).orderBy("config_id").show(truncate=False)
 
 # CELL ********************
 
-from pyspark.sql import functions as F
+# ============================================================
+# Setup: etl.config_tables (Unified config cho Bronze, Silver, Gold)
+# Run ONCE to create and seed the unified config table.
+# Updated: removed "DeliveryLocation" from Sales_Customers column_list
+# ============================================================
 
-METADATA_DB = "lh_vule_sonle_medallion"
-CONFIG_TABLE = f"{METADATA_DB}.etl.config_silver_tables"
+from pyspark.sql import Row
+from pyspark.sql.types import StructType, StructField, StringType, BooleanType, IntegerType
 
-# Định nghĩa column_list mới (đã bỏ DeliveryRun, RunPosition)
-new_column_list = (
-    "CustomerID, CustomerName, BillToCustomerID, CustomerCategoryID, "
-    "BuyingGroupID, PrimaryContactPersonID, AlternateContactPersonID, "
-    "DeliveryMethodID, DeliveryCityID, PostalCityID, CreditLimit, "
-    "AccountOpenedDate, StandardDiscountPercentage, IsStatementSent, "
-    "IsOnCreditHold, PaymentDays, PhoneNumber, FaxNumber, "
-    "WebsiteURL, DeliveryAddressLine1, DeliveryAddressLine2, "
-    "DeliveryPostalCode, DeliveryLocation, PostalAddressLine1, "
-    "PostalAddressLine2, PostalPostalCode, LastEditedBy, ValidFrom, ValidTo"
-)
+METADATA_DB  = "lh_vule_sonle_medallion"
+CONFIG_TABLE = f"{METADATA_DB}.etl.config_tables"
 
-# Đọc config hiện tại
-df_config = spark.table(CONFIG_TABLE)
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {METADATA_DB}.etl")
 
-# Cập nhật cột column_list cho config_id = 3
-df_updated = df_config.withColumn(
-    "column_list",
-    F.when(F.col("config_id") == 3, F.lit(new_column_list)).otherwise(F.col("column_list"))
-)
+# Drop and recreate unified config table
+spark.sql(f"DROP TABLE IF EXISTS {CONFIG_TABLE}")
 
-# Ghi đè bảng config
-df_updated.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(CONFIG_TABLE)
+schema = StructType([
+    StructField("config_id", IntegerType(), False),
+    StructField("layer", StringType(), False),
+    StructField("source_system", StringType(), True),
+    StructField("source_schema", StringType(), True),
+    StructField("source_table", StringType(), True),
+    StructField("source_object", StringType(), True),
+    StructField("load_type", StringType(), True),
+    StructField("watermark_column", StringType(), True),
+    StructField("business_key", StringType(), True),
+    StructField("column_list", StringType(), True),
+    StructField("is_active", BooleanType(), True),
+])
 
-print("Đã cập nhật column_list cho Sales_Customers (removed DeliveryRun, RunPosition).")
+# ---- Định nghĩa dữ liệu gốc cho Silver (và Bronze) ----
+base_rows = [
+    {
+        "source_system": "WWI",
+        "source_schema": "Sales",
+        "source_table": "Orders",
+        "source_object": "Sales_Orders",
+        "load_type": "incremental",
+        "watermark_column": "LastEditedWhen",
+        "business_key": "OrderID",
+        "column_list": (
+            "OrderID, CustomerID, SalespersonPersonID, PickedByPersonID, "
+            "ContactPersonID, BackorderOrderID, OrderDate, ExpectedDeliveryDate, "
+            "CustomerPurchaseOrderNumber, IsUndersupplyBackordered, Comments, "
+            "DeliveryInstructions, InternalComments, PickingCompletedWhen, "
+            "LastEditedBy, LastEditedWhen"
+        )
+    },
+    {
+        "source_system": "WWI",
+        "source_schema": "Sales",
+        "source_table": "OrderLines",
+        "source_object": "Sales_OrderLines",
+        "load_type": "incremental",
+        "watermark_column": "LastEditedWhen",
+        "business_key": "OrderLineID",
+        "column_list": (
+            "OrderLineID, OrderID, StockItemID, Description, PackageTypeID, "
+            "Quantity, UnitPrice, TaxRate, PickedQuantity, PickingCompletedWhen, "
+            "LastEditedBy, LastEditedWhen"
+        )
+    },
+    {
+        "source_system": "WWI",
+        "source_schema": "Sales",
+        "source_table": "Customers",
+        "source_object": "Sales_Customers",
+        "load_type": "full",
+        "watermark_column": None,
+        "business_key": "CustomerID",
+        # DeliveryLocation removed
+        "column_list": (
+            "CustomerID, CustomerName, BillToCustomerID, CustomerCategoryID, "
+            "BuyingGroupID, PrimaryContactPersonID, AlternateContactPersonID, "
+            "DeliveryMethodID, DeliveryCityID, PostalCityID, CreditLimit, "
+            "AccountOpenedDate, StandardDiscountPercentage, IsStatementSent, "
+            "IsOnCreditHold, PaymentDays, PhoneNumber, FaxNumber, DeliveryRun, "
+            "RunPosition, WebsiteURL, DeliveryAddressLine1, DeliveryAddressLine2, "
+            "DeliveryPostalCode, PostalAddressLine1, "
+            "PostalAddressLine2, PostalPostalCode, LastEditedBy, ValidFrom, ValidTo"
+        )
+    },
+    {
+        "source_system": "WWI",
+        "source_schema": "Sales",
+        "source_table": "CustomerCategories",
+        "source_object": "Sales_CustomerCategories",
+        "load_type": "full",
+        "watermark_column": None,
+        "business_key": "CustomerCategoryID",
+        "column_list": (
+            "CustomerCategoryID, CustomerCategoryName, LastEditedBy, ValidFrom, ValidTo"
+        )
+    },
+    {
+        "source_system": "WWI",
+        "source_schema": "Warehouse",
+        "source_table": "StockItems",
+        "source_object": "Warehouse_StockItems",
+        "load_type": "full",
+        "watermark_column": None,
+        "business_key": "StockItemID",
+        "column_list": (
+            "StockItemID, StockItemName, SupplierID, ColorID, UnitPackageID, "
+            "OuterPackageID, Brand, Size, LeadTimeDays, QuantityPerOuter, "
+            "IsChillerStock, Barcode, TaxRate, UnitPrice, RecommendedRetailPrice, "
+            "TypicalWeightPerUnit, MarketingComments, InternalComments, Photo, "
+            "CustomFields, Tags, SearchDetails, LastEditedBy, ValidFrom, ValidTo"
+        )
+    },
+    {
+        "source_system": "WWI",
+        "source_schema": "Application",
+        "source_table": "People",
+        "source_object": "Application_People",
+        "load_type": "full",
+        "watermark_column": None,
+        "business_key": "PersonID",
+        "column_list": (
+            "PersonID, FullName, PreferredName, SearchName, IsPermittedToLogon, "
+            "LogonName, IsExternalLogonProvider, HashedPassword, IsSystemUser, "
+            "IsEmployee, IsSalesperson, UserPreferences, PhoneNumber, FaxNumber, "
+            "EmailAddress, Photo, CustomFields, OtherLanguages, LastEditedBy, "
+            "ValidFrom, ValidTo"
+        )
+    }
+]
 
-# Kiểm tra kết quả
-spark.table(CONFIG_TABLE).filter("config_id = 3").select("column_list").show(truncate=False)
+# ---- Tạo danh sách tất cả các dòng (Bronze, Silver, Gold) ----
+all_rows = []
+config_id = 1
+
+# 1. Bronze rows (6 rows)
+for item in base_rows:
+    all_rows.append(Row(
+        config_id=config_id,
+        layer="Bronze",
+        source_system=item["source_system"],
+        source_schema=item["source_schema"],
+        source_table=item["source_table"],
+        source_object=item["source_object"],
+        load_type=item["load_type"],
+        watermark_column=item["watermark_column"],
+        business_key=item["business_key"],
+        column_list=item["column_list"],
+        is_active=True
+    ))
+    config_id += 1
+
+# 2. Silver rows (6 rows) - identical column_list
+for item in base_rows:
+    all_rows.append(Row(
+        config_id=config_id,
+        layer="Silver",
+        source_system=item["source_system"],
+        source_schema=item["source_schema"],
+        source_table=item["source_table"],
+        source_object=item["source_object"],
+        load_type=item["load_type"],
+        watermark_column=item["watermark_column"],
+        business_key=item["business_key"],
+        column_list=item["column_list"],
+        is_active=True
+    ))
+    config_id += 1
+
+# 3. Gold rows (6 rows) - different column_list, no source_schema/source_table
+gold_configs = [
+    {
+        "source_object": "Sales_Orders",
+        "load_type": "incremental",
+        "watermark_column": "LastEditedWhen",
+        "business_key": "OrderID",
+        "column_list": (
+            "OrderID, CustomerID, SalespersonPersonID, PickedByPersonID, "
+            "ContactPersonID, BackorderOrderID, OrderDate, ExpectedDeliveryDate, "
+            "CustomerPurchaseOrderNumber, IsUndersupplyBackordered, "
+            "PickingCompletedWhen, "
+            "LastEditedBy, LastEditedWhen"
+        )
+    },
+    {
+        "source_object": "Sales_OrderLines",
+        "load_type": "incremental",
+        "watermark_column": "LastEditedWhen",
+        "business_key": "OrderLineID",
+        "column_list": (
+            "OrderLineID, OrderID, StockItemID, Description, PackageTypeID, "
+            "Quantity, UnitPrice, TaxRate, PickedQuantity, PickingCompletedWhen, "
+            "LastEditedBy, LastEditedWhen"
+        )
+    },
+    {
+        "source_object": "Sales_Customers",
+        "load_type": "full",
+        "watermark_column": None,
+        "business_key": "CustomerID",
+        # DeliveryLocation removed
+        "column_list": (
+            "CustomerID, CustomerName, BillToCustomerID, CustomerCategoryID, "
+            "BuyingGroupID, PrimaryContactPersonID, AlternateContactPersonID, "
+            "DeliveryMethodID, DeliveryCityID, PostalCityID, CreditLimit, "
+            "AccountOpenedDate, StandardDiscountPercentage, IsStatementSent, "
+            "IsOnCreditHold, PaymentDays, PhoneNumber, FaxNumber, "
+            "DeliveryAddressLine1, DeliveryAddressLine2, "
+            "DeliveryPostalCode, PostalAddressLine1, "
+            "PostalAddressLine2, PostalPostalCode, LastEditedBy, ValidFrom, ValidTo"
+        )
+    },
+    {
+        "source_object": "Sales_CustomerCategories",
+        "load_type": "full",
+        "watermark_column": None,
+        "business_key": "CustomerCategoryID",
+        "column_list": (
+            "CustomerCategoryID, CustomerCategoryName, LastEditedBy, ValidFrom, ValidTo"
+        )
+    },
+    {
+        "source_object": "Warehouse_StockItems",
+        "load_type": "full",
+        "watermark_column": None,
+        "business_key": "StockItemID",
+        "column_list": (
+            "StockItemID, StockItemName, SupplierID, ColorID, UnitPackageID, "
+            "OuterPackageID, Brand, Size, LeadTimeDays, QuantityPerOuter, "
+            "IsChillerStock, Barcode, TaxRate, UnitPrice, RecommendedRetailPrice, "
+            "TypicalWeightPerUnit, "
+            "CustomFields, Tags, SearchDetails, LastEditedBy, ValidFrom, ValidTo"
+        )
+    },
+    {
+        "source_object": "Application_People",
+        "load_type": "full",
+        "watermark_column": None,
+        "business_key": "PersonID",
+        "column_list": (
+            "PersonID, FullName, PreferredName, SearchName, IsPermittedToLogon, "
+            "LogonName, IsExternalLogonProvider, IsSystemUser, "
+            "IsEmployee, IsSalesperson, UserPreferences, PhoneNumber, FaxNumber, "
+            "EmailAddress, LastEditedBy, "
+            "ValidFrom, ValidTo"
+        )
+    }
+]
+
+for item in gold_configs:
+    all_rows.append(Row(
+        config_id=config_id,
+        layer="Gold",
+        source_system="WWI",          # vẫn giữ source system
+        source_schema=None,
+        source_table=None,
+        source_object=item["source_object"],
+        load_type=item["load_type"],
+        watermark_column=item["watermark_column"],
+        business_key=item["business_key"],
+        column_list=item["column_list"],
+        is_active=True
+    ))
+    config_id += 1
+
+# ---- Tạo DataFrame và ghi bảng ----
+df = spark.createDataFrame(all_rows, schema=schema)
+
+df.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .saveAsTable(CONFIG_TABLE)
+
+print(f"Created {CONFIG_TABLE} with {df.count()} rows.")
+spark.table(CONFIG_TABLE).orderBy("layer", "config_id").show(truncate=False)
 
 # METADATA ********************
 

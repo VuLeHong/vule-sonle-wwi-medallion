@@ -29,7 +29,9 @@
 # GOLD NOTEBOOK — DIM_CUSTOMER (SCD2)
 # Source: Silver.Sales_Customers + Silver.Sales_CustomerCategories
 # SCD2 logic:
-#   - scd_from = audit_ts (thời điểm thay đổi trong Silver)
+#   - Đọc latest records từ Silver, không filter theo Gold watermark
+#   - Không xử lý soft delete
+#   - scd_from = audit_ts của latest record trong Silver
 #   - Recalculate SCD2 chain: scd_to, scd_version, scd_active
 #   - Xử lý inferred fill nếu có
 # ============================================================
@@ -50,16 +52,12 @@ SOURCE_OBJECT = "Sales_Customers"
 TARGET_OBJECT = "Dim_Customer"
 TARGET_SCHEMA = "Gold"
 
-CONFIG_TABLE = f"{METADATA_DB}.etl.config_gold_tables"
-WATERMARK_TABLE = f"{METADATA_DB}.etl.watermark"
+CONFIG_TABLE = f"{METADATA_DB}.etl.config_tables"
 
 SKEY_COL = "customer_skey"
 DEFAULT_SCD_TO = "2999-12-31 00:00:00"
 
 execution_start_time = datetime.now()
-
-# Flag để stop notebook thành công khi không có data mới
-no_new_data = False
 
 print("=" * 80)
 print("[START] Gold SCD2 load for DIM_CUSTOMER")
@@ -150,24 +148,19 @@ def align_to_target_columns(df, target_table: str):
     return df.select(*target_cols)
 
 
-def source_change_ts_expr():
-    return F.greatest(
-        F.to_timestamp(F.col("audit_ts")),
-        F.coalesce(
-            F.to_timestamp(F.col("deleted_audit_ts")),
-            F.to_timestamp(F.col("audit_ts"))
-        )
-    )
+def make_empty_df_like(df):
+    return spark.createDataFrame([], df.schema)
 
 
 # ============================================================
-# 3. Load Gold config cho Sales_Customers (primary)
+# 3. Load Gold config cho Sales_Customers
 # ============================================================
 
 try:
     config_row = (
         spark.table(CONFIG_TABLE)
         .filter(
+            (F.col("layer") == "Gold") &
             (F.col("source_object") == SOURCE_OBJECT) &
             (F.col("is_active") == 1)
         )
@@ -191,10 +184,10 @@ try:
     configured_columns = split_config_list(column_list)
 
     if not business_keys:
-        raise RuntimeError("[ERROR] business_key trong config_gold_tables đang trống")
+        raise RuntimeError("[ERROR] business_key trong config_tables đang trống")
 
     if not configured_columns:
-        raise RuntimeError("[ERROR] column_list trong config_gold_tables đang trống")
+        raise RuntimeError("[ERROR] column_list trong config_tables đang trống")
 
     silver_table_primary = f"{METADATA_DB}.{source_schema}.{source_object}"
     gold_table = f"{METADATA_DB}.{TARGET_SCHEMA}.{TARGET_OBJECT}"
@@ -210,13 +203,14 @@ except Exception as e:
 
 
 # ============================================================
-# 4. Đọc config cho lookup table (Sales_CustomerCategories)
+# 4. Đọc config cho lookup table Sales_CustomerCategories
 # ============================================================
 
 try:
     lookup_config_row = (
         spark.table(CONFIG_TABLE)
         .filter(
+            (F.col("layer") == "Gold") &
             (F.col("source_object") == "Sales_CustomerCategories") &
             (F.col("is_active") == 1)
         )
@@ -225,7 +219,7 @@ try:
     )
 
     if not lookup_config_row:
-        raise RuntimeError("[ERROR] Không tìm thấy config cho Sales_CustomerCategories (lookup)")
+        raise RuntimeError("[ERROR] Không tìm thấy config cho Sales_CustomerCategories")
 
     lookup_meta = lookup_config_row[0]
 
@@ -246,37 +240,9 @@ except Exception as e:
 
 
 # ============================================================
-# 5. Load Gold watermark
-# ============================================================
-
-try:
-    watermark_row = (
-        spark.table(WATERMARK_TABLE)
-        .filter(
-            (F.col("layer") == "gold") &
-            (F.col("object_name") == TARGET_OBJECT)
-        )
-        .orderBy(F.col("timestamp").desc())
-        .limit(1)
-        .select(F.to_timestamp("key_1").alias("max_audit_ts"))
-        .collect()
-    )
-
-    gold_watermark_ts = watermark_row[0]["max_audit_ts"] if watermark_row else None
-
-    print(f"[WATERMARK] Current Gold watermark: {gold_watermark_ts}")
-
-except Exception as e:
-    print(f"[FAILED] Load Gold watermark failed: {str(e)}")
-    raise
-
-
-# ============================================================
-# 6. Read changed records from Silver Primary
-#    Nếu không có data mới:
-#    - Không raise SystemExit
-#    - Set no_new_data = True
-#    - Sau try block sẽ notebookutils.notebook.exit("NO_NEW_DATA")
+# 5. Read latest records from Silver Primary
+#    Không dùng Gold watermark
+#    Không xử lý soft delete
 # ============================================================
 
 try:
@@ -286,32 +252,28 @@ try:
     if not table_exists(silver_table_lookup):
         raise RuntimeError(f"[ERROR] Lookup Silver table không tồn tại: {silver_table_lookup}")
 
-    df_primary = spark.table(silver_table_primary)
+    df_primary = df_primary.filter(F.col("deleted_audit_ts").isNull())
 
-    if "audit_ts" not in df_primary.columns:
-        raise RuntimeError("[ERROR] Primary Silver table không có audit_ts để chạy watermark Gold")
+    w_primary_latest = Window.partitionBy("_source_hash_key").orderBy(
+        F.col("audit_ts").desc()
+    )
 
-    if "deleted_audit_ts" not in df_primary.columns:
-        df_primary = df_primary.withColumn(
-            "deleted_audit_ts",
-            F.lit(None).cast(TimestampType())
-        )
+    df_primary_latest = (
+        df_primary
+        .withColumn("_source_hash_key", create_hash_expr(business_keys))
+        .withColumn("_rn", F.row_number().over(w_primary_latest))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn", "_source_hash_key")
+        .cache()
+    )
 
-    if gold_watermark_ts is None:
-        df_changed_primary = df_primary
-    else:
-        df_changed_primary = df_primary.filter(
-            source_change_ts_expr() > F.lit(gold_watermark_ts)
-        )
+    latest_primary_count = df_primary_latest.count()
 
-    if df_changed_primary.isEmpty():
-        no_new_data = True
-
+    if latest_primary_count == 0:
         execution_end_time = datetime.now()
 
         print("=" * 80)
-        print("[SUCCESS] Gold SCD2 load completed - No new data")
-        print("[STOP] No new data")
+        print("[SUCCESS] Gold SCD2 load completed - No data in Silver")
         print(f"[TARGET_OBJECT] {TARGET_OBJECT}")
         print(f"[SOURCE_OBJECT] {SOURCE_OBJECT}")
         print(f"[START_TIME] {execution_start_time}")
@@ -319,36 +281,17 @@ try:
         print(f"[DURATION] {execution_end_time - execution_start_time}")
         print("=" * 80)
 
-    else:
-        max_source_audit_ts = (
-            df_changed_primary
-            .agg(F.max(source_change_ts_expr()).alias("max_ts"))
-            .collect()[0]["max_ts"]
-        )
+        notebookutils.notebook.exit("NO_DATA_IN_SILVER")
 
-        changed_primary_count = df_changed_primary.count()
-
-        print(f"[INFO] Changed records from Silver: {changed_primary_count}")
-        print(f"[INFO] Max source audit/deleted timestamp from Silver: {max_source_audit_ts}")
+    print(f"[INFO] Latest records from Silver Primary: {latest_primary_count}")
 
 except Exception as e:
-    print(f"[FAILED] Read changed Silver records failed: {str(e)}")
+    print(f"[FAILED] Read latest Silver Primary records failed: {str(e)}")
     raise
 
 
 # ============================================================
-# Stop notebook successfully if no new data
-# IMPORTANT:
-#   - Không dùng raise SystemExit
-#   - Không đặt notebookutils.notebook.exit trong try/except
-# ============================================================
-
-if no_new_data:
-    notebookutils.notebook.exit("NO_NEW_DATA")
-
-
-# ============================================================
-# 7. Enrich changed records with lookup CustomerCategoryName
+# 6. Enrich latest primary records with latest lookup CustomerCategoryName
 # ============================================================
 
 try:
@@ -357,19 +300,35 @@ try:
     if "audit_ts" not in df_lookup.columns:
         raise RuntimeError("[ERROR] Lookup Silver table không có audit_ts")
 
-    if "deleted_audit_ts" not in df_lookup.columns:
-        df_lookup = df_lookup.withColumn(
-            "deleted_audit_ts",
-            F.lit(None).cast(TimestampType())
+    if "CustomerCategoryID" not in df_lookup.columns:
+        raise RuntimeError("[ERROR] Lookup Silver table không có CustomerCategoryID")
+
+    if "CustomerCategoryName" not in df_lookup.columns:
+        raise RuntimeError("[ERROR] Lookup Silver table không có CustomerCategoryName")
+
+    lookup_partition_cols = ["hash_key"] if "hash_key" in df_lookup.columns else lookup_business_keys
+
+    if not lookup_partition_cols:
+        lookup_partition_cols = ["CustomerCategoryID"]
+
+    missing_lookup_partition_cols = [
+        c for c in lookup_partition_cols
+        if c not in df_lookup.columns
+    ]
+
+    if missing_lookup_partition_cols:
+        raise RuntimeError(
+            f"[ERROR] Lookup Silver table thiếu partition columns để lấy latest: {missing_lookup_partition_cols}"
         )
 
-    w_lookup = Window.partitionBy("hash_key").orderBy(F.col("audit_ts").desc())
+    w_lookup_latest = Window.partitionBy(*lookup_partition_cols).orderBy(
+        F.col("audit_ts").desc()
+    )
 
     df_lookup_current = (
         df_lookup
-        .withColumn("_rn", F.row_number().over(w_lookup))
+        .withColumn("_rn", F.row_number().over(w_lookup_latest))
         .filter(F.col("_rn") == 1)
-        .filter(F.col("deleted_audit_ts").isNull())
         .drop("_rn")
         .select(
             F.col("CustomerCategoryID").alias("lookup_CustomerCategoryID"),
@@ -378,10 +337,10 @@ try:
     )
 
     df_enriched = (
-        df_changed_primary
+        df_primary_latest
         .join(
             F.broadcast(df_lookup_current),
-            df_changed_primary["CustomerCategoryID"] == df_lookup_current["lookup_CustomerCategoryID"],
+            df_primary_latest["CustomerCategoryID"] == df_lookup_current["lookup_CustomerCategoryID"],
             how="left"
         )
         .withColumn(
@@ -391,7 +350,7 @@ try:
         .drop("lookup_CustomerCategoryID")
     )
 
-    print("[INFO] Enriched changed records with CustomerCategoryName")
+    print("[INFO] Enriched latest primary records with latest CustomerCategoryName")
 
 except Exception as e:
     print(f"[FAILED] Enrich with lookup failed: {str(e)}")
@@ -399,7 +358,7 @@ except Exception as e:
 
 
 # ============================================================
-# 8. Prepare staged data
+# 7. Prepare staged data
 # ============================================================
 
 try:
@@ -410,8 +369,13 @@ try:
     if "source_id" in df_enriched.columns and "source_id" not in selected_cols:
         selected_cols.append("source_id")
 
-    if "deleted_audit_ts" in df_enriched.columns and "deleted_audit_ts" not in selected_cols:
-        selected_cols.append("deleted_audit_ts")
+    missing_selected_cols = [
+        c for c in selected_cols
+        if c not in df_enriched.columns
+    ]
+
+    if missing_selected_cols:
+        raise RuntimeError(f"[ERROR] Missing selected columns after enrich: {missing_selected_cols}")
 
     df_staged_raw = df_enriched.select(*selected_cols)
 
@@ -423,7 +387,6 @@ try:
     exclude_for_row_hash = set(business_keys) | {
         "audit_ts",
         "source_id",
-        "deleted_audit_ts",
         "hash_key",
         "row_hash"
     }
@@ -436,28 +399,15 @@ try:
     if not hash_columns:
         raise RuntimeError("[ERROR] Không có business attribute nào để tạo row_hash")
 
-    df_staged_raw = df_staged_raw.withColumn(
-        "row_hash",
-        create_hash_expr(hash_columns)
-    )
-
-    w_latest = Window.partitionBy("hash_key").orderBy(
-        source_change_ts_expr().desc(),
-        F.col("audit_ts").desc(),
-        F.col("deleted_audit_ts").desc_nulls_last()
-    )
-
     df_staged = (
         df_staged_raw
-        .withColumn("_rn", F.row_number().over(w_latest))
-        .filter(F.col("_rn") == 1)
-        .drop("_rn")
+        .withColumn("row_hash", create_hash_expr(hash_columns))
         .cache()
     )
 
     staged_count = df_staged.count()
 
-    print(f"[STAGED] Prepared staged records: {staged_count}")
+    print(f"[STAGED] Prepared staged latest records: {staged_count}")
     print(f"[STAGED] Row hash columns: {hash_columns}")
 
 except Exception as e:
@@ -466,7 +416,7 @@ except Exception as e:
 
 
 # ============================================================
-# 9. Create Gold schema if needed
+# 8. Create Gold schema if needed
 # ============================================================
 
 try:
@@ -479,7 +429,7 @@ except Exception as e:
 
 
 # ============================================================
-# 10. Fill inferred dimension records
+# 9. Fill inferred dimension records
 # ============================================================
 
 try:
@@ -515,7 +465,6 @@ try:
 
         df_inferred_to_fill = (
             df_staged
-            .filter(F.col("deleted_audit_ts").isNull())
             .join(df_gold_active_inferred, on="hash_key", how="inner")
             .cache()
         )
@@ -528,7 +477,6 @@ try:
             update_set = {
                 "audit_ts": "s.audit_ts",
                 "updated_audit_ts": "current_timestamp()",
-                "deleted_audit_ts": "s.deleted_audit_ts",
                 "row_hash": "s.row_hash",
                 "inferred_flag": "0"
             }
@@ -568,22 +516,11 @@ except Exception as e:
 
 
 # ============================================================
-# 11. Phân loại new / changed / deleted
+# 10. Phân loại new / changed
+#     Không xử lý deleted
 # ============================================================
 
 try:
-    df_non_deleted_staged = (
-        df_staged_after_inferred
-        .filter(F.col("deleted_audit_ts").isNull())
-        .cache()
-    )
-
-    df_deleted_staged = (
-        df_staged_after_inferred
-        .filter(F.col("deleted_audit_ts").isNotNull())
-        .cache()
-    )
-
     if table_exists(gold_table):
         df_gold_active = (
             spark.table(gold_table)
@@ -597,7 +534,7 @@ try:
         )
 
         df_new = (
-            df_non_deleted_staged
+            df_staged_after_inferred
             .join(
                 df_gold_active.select("hash_key"),
                 on="hash_key",
@@ -607,44 +544,31 @@ try:
         )
 
         df_changed = (
-            df_non_deleted_staged
+            df_staged_after_inferred
             .join(df_gold_active, on="hash_key", how="inner")
             .filter(F.col("row_hash") != F.col("_gold_row_hash"))
             .drop("_gold_row_hash", SKEY_COL)
             .cache()
         )
 
-        df_deleted = (
-            df_deleted_staged
-            .join(
-                df_gold_active.select("hash_key", SKEY_COL),
-                on="hash_key",
-                how="inner"
-            )
-            .cache()
-        )
-
     else:
-        df_new = df_non_deleted_staged.cache()
-        df_changed = spark.createDataFrame([], df_non_deleted_staged.schema)
-        df_deleted = spark.createDataFrame([], df_deleted_staged.schema)
+        df_new = df_staged_after_inferred.cache()
+        df_changed = make_empty_df_like(df_staged_after_inferred)
 
     new_rows = df_new.count()
     changed_rows = df_changed.count()
-    deleted_rows = df_deleted.count()
 
     print(f"[CHECK] New records      : {new_rows}")
     print(f"[CHECK] Changed records  : {changed_rows}")
-    print(f"[CHECK] Deleted records  : {deleted_rows}")
     print(f"[CHECK] Inferred filled  : {inferred_filled_rows}")
 
 except Exception as e:
-    print(f"[FAILED] Classify new/changed/deleted failed: {str(e)}")
+    print(f"[FAILED] Classify new/changed failed: {str(e)}")
     raise
 
 
 # ============================================================
-# 12. Build SCD2 insert dataframe
+# 11. Build SCD2 insert dataframe
 # ============================================================
 
 try:
@@ -672,7 +596,7 @@ except Exception as e:
 
 
 # ============================================================
-# 13. Insert new and changed records
+# 12. Insert new and changed records
 # ============================================================
 
 try:
@@ -725,50 +649,13 @@ except Exception as e:
 
 
 # ============================================================
-# 14. Handle soft delete
-# ============================================================
-
-try:
-    if deleted_rows > 0 and table_exists(gold_table):
-        df_deleted_update = (
-            df_deleted
-            .select(
-                SKEY_COL,
-                F.col("deleted_audit_ts").alias("_deleted_audit_ts")
-            )
-            .dropDuplicates([SKEY_COL])
-        )
-
-        DeltaTable.forName(spark, gold_table).alias("t") \
-            .merge(
-                df_deleted_update.alias("s"),
-                f"t.{SKEY_COL} = s.{SKEY_COL}"
-            ) \
-            .whenMatchedUpdate(set={
-                "deleted_audit_ts": "s._deleted_audit_ts",
-                "updated_audit_ts": "current_timestamp()"
-            }) \
-            .execute()
-
-        print(f"[DELETE] Marked deleted active rows: {deleted_rows}")
-
-    else:
-        print("[DELETE] No deleted records to process")
-
-except Exception as e:
-    print(f"[FAILED] Handle soft delete failed: {str(e)}")
-    raise
-
-
-# ============================================================
-# 15. Recalculate SCD2 columns
+# 13. Recalculate SCD2 columns
 # ============================================================
 
 try:
     affected_keys_df = (
         df_new.select("hash_key")
         .unionByName(df_changed.select("hash_key"))
-        .unionByName(df_deleted.select("hash_key"))
         .distinct()
         .cache()
     )
@@ -799,23 +686,14 @@ try:
             .withColumn(
                 "_new_scd_to",
                 F.when(
-                    F.col("deleted_audit_ts").isNotNull(),
-                    F.col("deleted_audit_ts")
-                )
-                .when(
                     F.col("_next_scd_from").isNotNull(),
                     F.col("_next_scd_from")
                 )
                 .otherwise(F.to_timestamp(F.lit(DEFAULT_SCD_TO)))
             )
-            
             .withColumn(
                 "_new_scd_active",
                 F.when(
-                    F.col("deleted_audit_ts").isNotNull(),
-                    F.lit(0)
-                )
-                .when(
                     F.col("_next_scd_from").isNull(),
                     F.lit(1)
                 )
@@ -856,33 +734,7 @@ except Exception as e:
 
 
 # ============================================================
-# 16. Update Gold watermark
-# ============================================================
-
-try:
-    watermark_new_df = (
-        spark.createDataFrame(
-            [("gold", TARGET_OBJECT, str(max_source_audit_ts), "datetime")],
-            ["layer", "object_name", "key_1", "key_1_desc"]
-        )
-        .withColumn("timestamp", F.current_timestamp())
-    )
-
-    watermark_new_df.write \
-        .format("delta") \
-        .mode("append") \
-        .option("mergeSchema", "true") \
-        .saveAsTable(WATERMARK_TABLE)
-
-    print(f"[WATERMARK] Updated Gold watermark: {max_source_audit_ts}")
-
-except Exception as e:
-    print(f"[FAILED] Update Gold watermark failed: {str(e)}")
-    raise
-
-
-# ============================================================
-# 17. Summary and cleanup
+# 14. Summary and cleanup
 # ============================================================
 
 try:
@@ -897,23 +749,20 @@ try:
     print(f"[END_TIME] {execution_end_time}")
     print(f"[DURATION] {execution_end_time - execution_start_time}")
     print("-" * 80)
-    print(f"[SUMMARY] New rows          : {new_rows}")
-    print(f"[SUMMARY] Changed rows      : {changed_rows}")
-    print(f"[SUMMARY] Inferred filled   : {inferred_filled_rows}")
-    print(f"[SUMMARY] Updated rows      : {total_updated_rows}")
-    print(f"[SUMMARY] Deleted rows      : {deleted_rows}")
-    print(f"[SUMMARY] Watermark updated : {max_source_audit_ts}")
+    print(f"[SUMMARY] Latest Silver rows : {latest_primary_count}")
+    print(f"[SUMMARY] New rows           : {new_rows}")
+    print(f"[SUMMARY] Changed rows       : {changed_rows}")
+    print(f"[SUMMARY] Inferred filled    : {inferred_filled_rows}")
+    print(f"[SUMMARY] Updated rows       : {total_updated_rows}")
     print("=" * 80)
 
 finally:
     for df_name in [
+        "df_primary_latest",
         "df_staged",
         "df_staged_after_inferred",
-        "df_non_deleted_staged",
-        "df_deleted_staged",
         "df_new",
         "df_changed",
-        "df_deleted",
         "affected_keys_df"
     ]:
         if df_name in locals():

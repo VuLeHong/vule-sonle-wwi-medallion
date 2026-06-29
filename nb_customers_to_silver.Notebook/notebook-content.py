@@ -59,10 +59,10 @@ def drop_unwanted_cols(df):
     return df
 # =============================================================================================
 
-# ── 1. Hardcode sẵn (Chuyển sang dnyamic params sau) ──────────────────────
+# ── 1. Hardcode sẵn (Chuyển sang dynamic params sau) ──────────────────────
 TARGET_OBJECT = "Sales_Customers"
 METADATA_DB   = "lh_vule_sonle_medallion"
-CONFIG_TABLE  = f"{METADATA_DB}.etl.config_silver_tables"
+CONFIG_TABLE  = f"{METADATA_DB}.etl.config_tables"                 # <-- SỬA 1
 silver_table  = f"{METADATA_DB}.Silver.{TARGET_OBJECT}"
 
 print(f"[INFO] Bắt đầu kích hoạt Pipeline chuyên biệt cho thực thể: {silver_table}")
@@ -70,7 +70,11 @@ print(f"[INFO] Bắt đầu kích hoạt Pipeline chuyên biệt cho thực th�
 # ── 2. Lấy tham số từ config table ─────────────
 config_row = (
     spark.table(CONFIG_TABLE)
-    .filter((F.col("source_object") == TARGET_OBJECT) & (F.col("is_active") == 1))
+    .filter(
+        (F.col("layer") == "Silver") &                           # <-- SỬA 2
+        (F.col("source_object") == TARGET_OBJECT) &
+        (F.col("is_active") == 1)
+    )
     .collect()
 )
 if not config_row:
@@ -161,60 +165,118 @@ df_staged = (
     .withColumn("deleted_audit_ts", F.lit(None).cast(TimestampType()))
 ).cache()
 
-# ── 5. ĐỐI CHIẾU VỚI CƠ SỞ DỮ LIỆU ĐÍCH SILVER ───────────────
+# ============================================================
+# READ & WRITE TO SILVER TABLE
+# ============================================================
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {METADATA_DB}.Silver")
 
+# --- Lần đầu chạy: bảng Silver chưa tồn tại ---
 if not spark.catalog.tableExists(silver_table):
-    print(f"[FIRST-RUN] Bảng '{silver_table}' chưa tồn tại. Tiến hành khởi tạo...")
-    df_to_insert = df_staged
+    print(f"[FIRST-RUN] Tạo mới bảng {silver_table} và ghi toàn bộ dữ liệu từ Bronze")
+
+    # Ghi toàn bộ df_staged (dữ liệu đã làm sạch, dedup, hash) vào bảng Silver
+    df_staged.write \
+        .format("delta") \
+        .mode("overwrite") \
+        .option("overwriteSchema", "true") \
+        .saveAsTable(silver_table)
+
+    print(f"[FIRST-RUN] Đã ghi {df_staged.count()} dòng vào {silver_table}")
+
 else:
-    print(f"Bảng '{silver_table}' đã tồn tại. Đối chiếu thay đổi...")
+    # --- Các lần chạy tiếp theo: đối chiếu với Silver hiện tại ---
+    print(f"[INFO] Bảng {silver_table} đã tồn tại. Thực hiện upsert + soft‑delete.")
+
+    # 1. Lấy các hash_key có trong staged
     df_staged_keys = df_staged.select("hash_key").distinct()
+
+    # 2. Lấy tập active mới nhất trong Silver (dòng mới nhất, chưa bị xóa)
     w_rank = Window.partitionBy("hash_key").orderBy(F.col("audit_ts").desc())
+
     df_silver_active = (
         spark.table(silver_table)
-        .join(F.broadcast(df_staged_keys), on="hash_key", how="inner")
         .withColumn("_rn", F.row_number().over(w_rank))
-        .filter((F.col("_rn") == 1) & F.col("deleted_audit_ts").isNull())
-        .select("hash_key", "row_hash")
+        .filter(
+            (F.col("_rn") == 1) &
+            (F.col("deleted_audit_ts").isNull())
+        )
+        .drop("_rn")
         .cache()
     )
 
-    df_new = df_staged.join(df_silver_active.select("hash_key"), on="hash_key", how="left_anti")
+    # 3. Phân loại NEW, CHANGED, DELETED
+    # New: hash_key có trong staged nhưng không có trong silver active
+    df_new = (
+        df_staged
+        .join(
+            df_silver_active.select("hash_key"),
+            on="hash_key",
+            how="left_anti"
+        )
+    )
+
+    # Changed: cùng hash_key, nhưng row_hash khác
     df_changed = (
         df_staged
-        .join(df_silver_active.withColumnRenamed("row_hash", "_silver_rh"), on="hash_key", how="inner")
-        .filter(F.col("row_hash") != F.col("_silver_rh"))
-        .drop("_silver_rh")
+        .join(
+            df_silver_active
+                .select("hash_key", "row_hash")
+                .withColumnRenamed("row_hash", "_silver_row_hash"),
+            on="hash_key",
+            how="inner"
+        )
+        .filter(F.col("row_hash") != F.col("_silver_row_hash"))
+        .drop("_silver_row_hash")
     )
+
+    # Deleted: hash_key có trong silver active nhưng không có trong staged
+    df_deleted = (
+        df_silver_active
+        .select("hash_key")          # chỉ cần hash_key để soft‑delete
+        .distinct()
+        .join(
+            df_staged_keys,
+            on="hash_key",
+            how="left_anti"
+        )
+        .withColumn("deleted_audit_ts", F.current_timestamp())
+    )
+
+    # 4. Ghi NEW và CHANGED vào Silver (append)
     df_upsert = df_new.unionByName(df_changed)
 
-    # SoftDelete
-    df_all_active_silver = (
-        spark.table(silver_table)
-        .withColumn("_rn", F.row_number().over(w_rank))
-        .filter((F.col("_rn") == 1) & F.col("deleted_audit_ts").isNull())
-        .drop("_rn")
-    )
-    df_deleted_keys = df_all_active_silver.select("hash_key").distinct().join(df_staged_keys, on="hash_key", how="left_anti")
-    if not df_deleted_keys.isEmpty():
-        df_deleted = (
-            df_deleted_keys.join(df_all_active_silver, on="hash_key", how="inner")
-            .withColumn("deleted_audit_ts", F.current_timestamp())
-        ).select(df_upsert.columns)
-        df_upsert = df_upsert.unionByName(df_deleted)
-    df_to_insert = df_upsert
+    if not df_upsert.isEmpty():
+        print(f"[UPSERT] Ghi {df_upsert.count()} dòng mới/thay đổi vào {silver_table}")
+        df_upsert.write \
+            .format("delta") \
+            .mode("append") \
+            .saveAsTable(silver_table)
+    else:
+        print("[UPSERT] Không có dòng mới hoặc thay đổi")
 
-# ── 6. THỰC THI GHI APPEND-ONLY VÀO DELTA LAKE ───────────────
-rows_to_insert = df_to_insert.count() if df_to_insert else 0
-if rows_to_insert > 0:
-    df_to_insert.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(silver_table)
-    print(f"[SUCCESS] Đã cập nhật {rows_to_insert} dòng vào {silver_table}.")
-else:
-    print("[INFO] Không có dữ liệu mới/thay đổi. Bỏ qua ghi.")
+    # 5. Soft‑delete các dòng đã biến mất
+    if not df_deleted.isEmpty():
+        print(f"[SOFT DELETE] Đánh dấu xóa cho {df_deleted.count()} dòng trong {silver_table}")
 
-df_staged.unpersist()
-if 'df_silver_active' in locals(): df_silver_active.unpersist()
+        delta_target = DeltaTable.forName(spark, silver_table)
+        delta_target.alias("t") \
+            .merge(
+                df_deleted.alias("s"),
+                """
+                t.hash_key = s.hash_key
+                AND t.deleted_audit_ts IS NULL
+                """
+            ) \
+            .whenMatchedUpdate(
+                set={"deleted_audit_ts": "s.deleted_audit_ts"}
+            ) \
+            .execute()
+    else:
+        print("[SOFT DELETE] Không có dòng cần xóa")
+
+    # 6. Giải phóng cache
+    df_staged.unpersist()
+    df_silver_active.unpersist()
 
 # ── 7. APPEND WATERMARK MỚI CHO SILVER ───────────────────────
 watermark_new_df = (

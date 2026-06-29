@@ -72,13 +72,14 @@ def drop_unwanted_cols(df):
 TARGET_OBJECT = "Sales_OrderLines"
 METADATA_DB   = "lh_vule_sonle_medallion"
 
-CONFIG_TABLE = f"{METADATA_DB}.etl.config_silver_tables"
+CONFIG_TABLE = f"{METADATA_DB}.etl.config_tables"
 WATERMARK_TABLE = f"{METADATA_DB}.etl.watermark"
 
 silver_schema = "Silver"
 silver_table  = f"{METADATA_DB}.{silver_schema}.{TARGET_OBJECT}"
 
 no_new_bronze_data = False
+rows_to_insert = 0                     # <-- THÊM BIẾN
 
 print("=" * 80)
 print("[START] Silver incremental load started")
@@ -95,6 +96,7 @@ try:
     config_row = (
         spark.table(CONFIG_TABLE)
         .filter(
+            (F.col("layer") == "Silver") &
             (F.col("source_object") == TARGET_OBJECT) &
             (F.col("is_active") == 1)
         )
@@ -195,9 +197,6 @@ except Exception as e:
 
 # ============================================================
 # Stop notebook successfully if no new Bronze data
-# IMPORTANT:
-#   - Không dùng raise RuntimeError/SystemExit cho case no data
-#   - Không đặt notebookutils.notebook.exit trong try/except
 # ============================================================
 
 if no_new_bronze_data:
@@ -300,91 +299,77 @@ except Exception as e:
 
 
 # ============================================================
-# 6. Đối chiếu với Silver
+# 6. ĐỐI CHIẾU VỚI SILVER (INCREMENTAL - NO SOFT DELETE)
 # ============================================================
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {METADATA_DB}.Silver")
 
-try:
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {METADATA_DB}.{silver_schema}")
+# --- Lần đầu chạy: bảng Silver chưa tồn tại ---
+if not spark.catalog.tableExists(silver_table):
+    print(f"[FIRST-RUN] Tạo mới bảng {silver_table} và ghi toàn bộ dữ liệu từ Bronze")
+    df_staged.write \
+        .format("delta") \
+        .mode("overwrite") \
+        .option("overwriteSchema", "true") \
+        .saveAsTable(silver_table)
+    rows_to_insert = staged_count      # <-- GÁN GIÁ TRỊ
+    print(f"[FIRST-RUN] Đã ghi {rows_to_insert} dòng vào {silver_table}")
 
-    if not spark.catalog.tableExists(silver_table):
-        print(f"[FIRST-RUN] Tạo bảng {silver_table}")
-        df_to_insert = df_staged
+else:
+    # --- Các lần sau: so sánh new/changed ---
+    df_staged_keys = df_staged.select("hash_key").distinct()
+    w_rank = Window.partitionBy("hash_key").orderBy(F.col("audit_ts").desc())
 
-    else:
-        print(f"[INFO] Bảng {silver_table} đã tồn tại. Đối chiếu thay đổi.")
+    df_silver_active = (
+        spark.table(silver_table)
+        .withColumn("_rn", F.row_number().over(w_rank))
+        .filter(F.col("_rn") == 1)                # không có cột deleted_audit_ts
+        .drop("_rn")
+        .cache()
+    )
 
-        df_staged_keys = df_staged.select("hash_key").distinct()
-
-        w_rank = (
-            Window
-            .partitionBy("hash_key")
-            .orderBy(F.col("audit_ts").desc())
+    # New: key có trong staged nhưng không có trong silver active
+    df_new = (
+        df_staged
+        .join(
+            df_silver_active.select("hash_key"),
+            on="hash_key",
+            how="left_anti"
         )
+    )
 
-        df_silver_active = (
-            spark.table(silver_table)
-            .join(F.broadcast(df_staged_keys), on="hash_key", how="inner")
-            .withColumn("_rn", F.row_number().over(w_rank))
-            .filter(F.col("_rn") == 1)
-            .select("hash_key", "row_hash")
-            .cache()
+    # Changed: cùng key, row_hash khác
+    df_changed = (
+        df_staged
+        .join(
+            df_silver_active
+                .select("hash_key", "row_hash")
+                .withColumnRenamed("row_hash", "_silver_row_hash"),
+            on="hash_key",
+            how="inner"
         )
+        .filter(F.col("row_hash") != F.col("_silver_row_hash"))
+        .drop("_silver_row_hash")
+    )
 
-        df_new = (
-            df_staged
-            .join(
-                df_silver_active.select("hash_key"),
-                on="hash_key",
-                how="left_anti"
-            )
-        )
+    df_to_insert = df_new.unionByName(df_changed)
 
-        df_changed = (
-            df_staged
-            .join(
-                df_silver_active.withColumnRenamed("row_hash", "_silver_rh"),
-                on="hash_key",
-                how="inner"
-            )
-            .filter(F.col("row_hash") != F.col("_silver_rh"))
-            .drop("_silver_rh")
-        )
-
-        df_to_insert = df_new.unionByName(df_changed)
-
-except Exception as e:
-    print(f"[FAILED] Compare with Silver failed: {str(e)}")
-    raise
-
-
-# ============================================================
-# 7. Ghi vào Silver
-# ============================================================
-
-try:
-    rows_to_insert = df_to_insert.count()
-
-    if rows_to_insert > 0:
-        (
-            df_to_insert
-            .write
-            .format("delta")
-            .mode("append")
-            .option("mergeSchema", "true")
+    if not df_to_insert.isEmpty():
+        rows_to_insert = df_to_insert.count()   # <-- GÁN GIÁ TRỊ
+        print(f"[UPSERT] Insert {rows_to_insert} new/changed rows vào {silver_table}")
+        df_to_insert.write \
+            .format("delta") \
+            .mode("append") \
             .saveAsTable(silver_table)
-        )
-
-        print(f"[SUCCESS] Đã ghi {rows_to_insert} dòng vào {silver_table}")
     else:
-        print("[INFO] Không có dòng mới hoặc dòng thay đổi. Bỏ qua ghi Silver.")
+        rows_to_insert = 0                      # <-- GÁN 0 NẾU KHÔNG CÓ GÌ
+        print("[UPSERT] Không có new/changed rows")
 
-except Exception as e:
-    print(f"[FAILED] Append to Silver failed: {str(e)}")
-    raise
+    df_silver_active.unpersist()
 
+df_staged.unpersist()
 
 # ============================================================
-# 8. Cập nhật watermark
+# 7. APPEND WATERMARK MỚI (GỘP LẠI, KHÔNG TRÙNG LẶP)
 # ============================================================
 
 try:
@@ -396,13 +381,11 @@ try:
         .withColumn("timestamp", F.current_timestamp())
     )
 
-    (
-        watermark_new_df
+    (watermark_new_df
         .write
         .format("delta")
         .mode("append")
-        .saveAsTable(WATERMARK_TABLE)
-    )
+        .saveAsTable(WATERMARK_TABLE))
 
     print(f"[SUCCESS] Watermark updated: {latest_audit_ts}")
 
@@ -412,7 +395,7 @@ except Exception as e:
 
 
 # ============================================================
-# 9. End log and cleanup
+# 8. End log and cleanup
 # ============================================================
 
 try:
